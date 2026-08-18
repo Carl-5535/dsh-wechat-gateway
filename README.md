@@ -8,6 +8,8 @@
 
 手机微信发消息 → 本机 `dsh web` 进程里的 Agent 干活 → 回复送回微信。不是外部 bridge：插件以 Cordis 插件形式直接运行在 DSH Host 进程内，每个微信聊天对应一个持久 DSH 会话，可在 Web UI 同时查看和接管。
 
+<p align="center"><img src="assets/weixin_login.png" alt="在 DSH 侧边栏扫码连接微信" width="360"></p>
+
 ## 特性
 
 - **扫码即用**：DSH 侧边栏内直接扫码登录，二维码本地渲染、弹层内完成验证，全程不离开主页
