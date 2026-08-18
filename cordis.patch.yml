@@ -1,0 +1,17 @@
+# Cordis 补丁：把插件以 wechat-gateway 身份插入 web profile，配置全部由环境变量驱动。
+- insert:
+    - id: wechat-gateway
+      name: dsh-wechat-gateway
+      config:
+        tokenEnv: WECHAT_BOT_TOKEN
+        credentialPath: !!js process.env.WECHAT_CREDENTIAL_PATH
+        statePath: !!js process.env.WECHAT_STATE_PATH
+        accountId: !!js process.env.WECHAT_BOT_ACCOUNT_ID
+        apiBase: !!js process.env.WECHAT_BOT_API_BASE
+        cdnBase: !!js process.env.WECHAT_CDN_BASE
+        workspace: !!js process.env.WECHAT_WORKSPACE
+        mediaDir: !!js process.env.WECHAT_MEDIA_DIR
+        allowedUsers: !!js (process.env.WECHAT_ALLOWED_USERS ?? '').split(',').map(value => value.trim()).filter(Boolean)
+        allowedGroups: !!js (process.env.WECHAT_ALLOWED_GROUPS ?? '').split(',').map(value => value.trim()).filter(Boolean)
+        maxMessageChars: !!js Number(process.env.WECHAT_MAX_MESSAGE_CHARS) || undefined
+        maxMediaBytes: !!js Number(process.env.WECHAT_MAX_MEDIA_BYTES) || undefined
