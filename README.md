@@ -33,6 +33,15 @@ dsh web                          # 默认 http://127.0.0.1:3080
 # 4. 用你自己的微信给机器人账号发条消息即可
 ```
 
+> pnpm ≥ 10 安全策略要求显式允许 git 插件的构建脚本。如果安装时遇到
+> `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`，在 profile 目录（默认
+> `~/.dsh/profiles/web/`）的 `pnpm-workspace.yaml` 中添加：
+> ```yaml
+> onlyBuiltDependencies:
+>   - dsh-wechat-gateway
+> ```
+> 然后重新执行 `dsh plugin --profile web add` 即可。
+
 > Windows 本地开发安装注意：用反斜杠绝对路径（`D:\path\to\dsh-wechat-gateway`），
 > 不要写 `file:D:/...`——pnpm 在 Windows 上会拼错路径。macOS / Linux 用 `file:/绝对路径` 即可。
 
