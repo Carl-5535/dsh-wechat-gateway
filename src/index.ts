@@ -17,6 +17,7 @@ import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type { SessionEvent, JsonValue } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import type {} from '@deepseek-ai/dsh-llm'
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { ILinkClient, type InboundMessage } from './ilink.js'
 import { defaultCredentialPath, pathExists, readCredential } from './store.js'
@@ -29,7 +30,7 @@ import { mountLoginRoute } from './web-login.js'
 export const name = 'wechat-gateway'
 
 /** 网关需要注入的 DSH 服务。 */
-export const inject = ['agentDefaultModel', 'agentPresets', 'agents', 'permissionPresets', 'sessions', 'sessionTitle', 'tools']
+export const inject = ['agentDefaultModel', 'agentPresets', 'agents', 'llm', 'permissionPresets', 'sessions', 'sessionTitle', 'tools']
 
 export interface Config {
   tokenEnv: string
@@ -90,9 +91,43 @@ export function assistantText(events: readonly SessionEvent[], afterSeq: number)
 
 interface ChatState {
   handle: AgentHandle
+  /** 本聊天的活模型选择引用：改 current 即热切换，下一轮生效。 */
+  selectionRef: ModelSelectionRef
   sentThroughSeq: number
   delivery: Promise<void>
   typing: Promise<void>
+}
+
+/** 本地模型目录的一个条目（provider + 模型）。 */
+export interface ModelEntry {
+  provider: string
+  id: string
+  name: string
+}
+
+/**
+ * /model 的选择匹配：序号（从 1 起）、「provider/model」、模型 id（忽略大小写）
+ * 或唯一匹配的模型名。返回 undefined 表示没有匹配，multiple 表示名称歧义。
+ */
+export function matchModelEntry(catalog: readonly ModelEntry[], input: string, ): ModelEntry | 'multiple' | undefined {
+  const query = input.trim()
+  if (query === '') return undefined
+  if (/^\d+$/.test(query)) {
+    const index = Number(query) - 1
+    return catalog[index]
+  }
+  const slash = query.split('/')
+  if (slash.length === 2) {
+    const [provider, id] = slash.map(part => part.trim().toLowerCase())
+    return catalog.find(entry => entry.provider.toLowerCase() === provider && entry.id.toLowerCase() === id)
+  }
+  const byId = catalog.filter(entry => entry.id.toLowerCase() === query.toLowerCase())
+  if (byId.length === 1) return byId[0]
+  if (byId.length > 1) return 'multiple'
+  const byName = catalog.filter(entry => entry.name.toLowerCase() === query.toLowerCase())
+  if (byName.length === 1) return byName[0]
+  if (byName.length > 1) return 'multiple'
+  return undefined
 }
 
 interface AgentPresetService {
@@ -124,6 +159,7 @@ const HELP_TEXT = [
   '  /status 或 /状态 —— 查看会话状态',
   '  /stop 或 /停止 —— 中止当前任务',
   '  /new 或 /新会话 —— 开启全新会话（丢弃当前上下文）',
+  '  /model 或 /模型 —— 查看可用模型；/model 序号或模型id 切换（仅本聊天生效）',
   '发给我的图片/文件会保存到工作区；我可以用 [[send-file:路径]] 把工作区文件发回给你。',
 ].join('\n')
 
@@ -138,6 +174,8 @@ class WechatGateway {
   readonly #seen: Set<string>
   /** 登录账号（扫码人）的 chatId，主动推送的目标。 */
   readonly #ownerChatId: string | undefined
+  /** 本地模型目录缓存（30 秒 TTL，避免连续 /model 反复询问 provider）。 */
+  #catalog?: { at: number; models: ModelEntry[] }
 
   constructor(ctx: Context, config: Config, connection: { token: string; accountId?: string; apiBase: string; ownerChatId?: string }, store: GatewayStateStore) {
     this.#ctx = ctx
@@ -296,6 +334,68 @@ class WechatGateway {
     }
   }
 
+  /** 枚举本地已配置 provider 的模型目录（带 TTL 缓存；单个 provider 失败跳过）。 */
+  async #modelCatalog(): Promise<ModelEntry[]> {
+    if (this.#catalog !== undefined && Date.now() - this.#catalog.at < 30_000) return this.#catalog.models
+    const models: ModelEntry[] = []
+    for (const provider of this.#ctx.llm.listProviders()) {
+      try {
+        for (const model of await this.#ctx.llm.listModels(provider.id)) {
+          models.push({ provider: model.provider, id: model.id, name: model.name })
+        }
+      } catch {
+        // 目录是 advisory 的：某个 provider 查询失败只影响列表完整度
+      }
+    }
+    this.#catalog = { at: Date.now(), models }
+    return models
+  }
+
+  /** /model：无参列出本地可用模型并标记当前项；带参切换本聊天的模型。 */
+  async #modelCommand(chatId: string, rest: string): Promise<void> {
+    const state = this.#chats.get(chatId)
+    const current = state?.selectionRef.current ?? this.#ctx.agentDefaultModel.currentSelection()
+    if (rest === '') {
+      const catalog = await this.#modelCatalog()
+      if (catalog.length === 0) {
+        await this.#sendWithRetry(chatId, '本地未发现可枚举的模型目录，可直接用 /model <provider>/<model> 指定。')
+        return
+      }
+      const lines = ['可用模型（✅ 为当前使用，切换仅对本聊天生效）：']
+      const shown = catalog.slice(0, 50)
+      shown.forEach((model, index) => {
+        const mark = model.provider === current.provider && model.id === current.model ? ' ✅' : ''
+        lines.push(`${index + 1}. ${model.name}（${model.provider}/${model.id}）${mark}`)
+      })
+      if (catalog.length > shown.length) lines.push(`… 其余 ${catalog.length - shown.length} 个略，可用 /model 模型id 直达`)
+      lines.push('切换：/model 序号、/model 模型id 或 /model provider/model')
+      await this.#sendWithRetry(chatId, lines.join('\n'))
+      return
+    }
+    const catalog = await this.#modelCatalog()
+    const chosen = matchModelEntry(catalog, rest)
+    if (chosen === 'multiple') {
+      await this.#sendWithRetry(chatId, `「${rest}」匹配到多个模型，请用 /model 模型id 或 /model provider/model 指定。`)
+      return
+    }
+    if (chosen === undefined) {
+      // 目录未收录也允许 provider/model 形式直接指定（目录是 advisory 的）
+      const parts = rest.split('/').map(part => part.trim())
+      if (parts.length === 2 && parts[0] !== '' && parts[1] !== '') {
+        const target = { provider: parts[0]!, model: parts[1]! }
+        const chat = state ?? await this.#chat(chatId)
+        chat.selectionRef.current = target
+        await this.#sendWithRetry(chatId, `已切换到 ${target.provider}/${target.model}，下一条消息生效。`)
+        return
+      }
+      await this.#sendWithRetry(chatId, `没有匹配「${rest}」的模型，发送 /model 查看列表。`)
+      return
+    }
+    const chat = state ?? await this.#chat(chatId)
+    chat.selectionRef.current = { provider: chosen.provider, model: chosen.id }
+    await this.#sendWithRetry(chatId, `已切换到 ${chosen.name}（${chosen.provider}/${chosen.id}），下一条消息生效。`)
+  }
+
   async #pollLoop(): Promise<void> {
     while (!this.#abort.signal.aborted) {
       try {
@@ -341,6 +441,11 @@ class WechatGateway {
       await this.#sendWithRetry(message.chatId, '已开启新会话，下一条消息将从头开始。')
       return
     }
+    if (command === '/model' || command === '/模型' || command.startsWith('/model ') || message.text.trim().startsWith('/模型 ')) {
+      const rest = message.text.trim().replace(/^\/(?:model|模型)\s*/u, '').trim()
+      await this.#modelCommand(message.chatId, rest)
+      return
+    }
     const state = await this.#chat(message.chatId)
     const blocks: Parameters<typeof contentUserMessage>[0] = []
     if (message.text !== '') blocks.push({ type: 'text', text: message.text })
@@ -373,11 +478,12 @@ class WechatGateway {
     const existing = this.#chats.get(chatId)
     if (existing !== undefined) return existing
     const selection = this.#ctx.agentDefaultModel.currentSelection()
+    // 活引用：/model 修改 current 即可在不重建会话的情况下切换模型。
+    const selected: ModelSelectionRef = { current: selection, assembled: undefined }
     const setup = async (agentCtx: Context): Promise<void> => {
       const agentPresets = this.#ctx.get('agentPresets') as AgentPresetService | undefined
       if (agentPresets === undefined) throw new Error('wechat-gateway: agentPresets 服务不可用')
       await agentPresets.mount(agentCtx)
-      const selected: ModelSelectionRef = { current: selection, assembled: undefined }
       installSelection(agentCtx, selected, [
         '本会话与一个微信聊天相连，同时可在 Harness Web UI 中查看。',
         '从微信收到的文件保存在工作区内，用户消息中会列出绝对路径。',
@@ -411,7 +517,7 @@ class WechatGateway {
     } else {
       handle = await this.#createAgent(selection, setup)
     }
-    const state = { handle, sentThroughSeq: handle.agent.session.seq, delivery: Promise.resolve(), typing: Promise.resolve() }
+    const state = { handle, selectionRef: selected, sentThroughSeq: handle.agent.session.seq, delivery: Promise.resolve(), typing: Promise.resolve() }
     const permissionPresets = this.#ctx.get('permissionPresets') as PermissionPresetService | undefined
     if (permissionPresets === undefined) throw new Error('wechat-gateway: permissionPresets 服务不可用')
     permissionPresets.set(handle.agent.session, 'workspace-write')
