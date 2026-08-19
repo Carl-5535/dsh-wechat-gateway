@@ -497,26 +497,33 @@ class WechatGateway {
     const selection = this.#ctx.agentDefaultModel.currentSelection()
     // 活引用：/model 修改 current 即可在不重建会话的情况下切换模型。
     const selected: ModelSelectionRef = { current: selection, assembled: undefined }
+    const instructions = [
+      '本会话与一个微信聊天相连，同时可在 Harness Web UI 中查看。',
+      '从微信收到的文件保存在工作区内，用户消息中会列出绝对路径。',
+      '要把工作区文件发回微信，在最终回复中单独一行写指令：[[send-file:relative/or/absolute/path]]。',
+      '仅当用户明确要求或确有必要时才请求发送文件；该指令会从送达微信的文本中移除。',
+      '回复将原样送达微信（纯文本），避免使用依赖渲染的复杂 Markdown 表格。',
+      '你的回复会自动送达微信，无需对本会话调用 wechat_notify；该工具供其他会话主动推送使用。',
+    ].join('\n')
+    // 创建路径：挂载 presets + 安装 selection waterfall
     const setup = async (agentCtx: Context): Promise<void> => {
       const agentPresets = this.#ctx.get('agentPresets') as AgentPresetService | undefined
       if (agentPresets === undefined) throw new Error('wechat-gateway: agentPresets 服务不可用')
       await agentPresets.mount(agentCtx)
-      installSelection(agentCtx, selected, [
-        '本会话与一个微信聊天相连，同时可在 Harness Web UI 中查看。',
-        '从微信收到的文件保存在工作区内，用户消息中会列出绝对路径。',
-        '要把工作区文件发回微信，在最终回复中单独一行写指令：[[send-file:relative/or/absolute/path]]。',
-        '仅当用户明确要求或确有必要时才请求发送文件；该指令会从送达微信的文本中移除。',
-        '回复将原样送达微信（纯文本），避免使用依赖渲染的复杂 Markdown 表格。',
-        '你的回复会自动送达微信，无需对本会话调用 wechat_notify；该工具供其他会话主动推送使用。',
-      ].join('\n'))
+      installSelection(agentCtx, selected, instructions)
     }
     const persistedSession = this.#store.state.chats[chatId]
     let handle: AgentHandle
     if (persistedSession !== undefined) {
       const active = this.#ctx.agents.get(sessionId(persistedSession))
       if (active !== undefined) {
-        // 会话已被 Web UI 等其他持有者打开：附着但不持有销毁权，
-        // /new 与插件卸载不得摧毁他方拥有的会话。
+        // 会话已被 Web UI 等其他持有者打开：附着但不持有销毁权。
+        // 只安装 selection waterfall（不重复 mount presets），使 /model 在附着会话也能生效。
+        try {
+          installSelection(active.ctx, selected, instructions)
+        } catch (error) {
+          this.#log(`附着时安装 selection waterfall 失败: ${error instanceof Error ? error.message : String(error)}`)
+        }
         handle = { agent: active, dispose: () => Promise.resolve() }
       } else {
         try {

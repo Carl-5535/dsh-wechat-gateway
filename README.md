@@ -46,7 +46,7 @@ dsh web                          # 默认 http://127.0.0.1:3080
 | `/status` `/状态` | 查看会话状态 |
 | `/stop` `/停止` | 中止当前任务 |
 | `/new` `/新会话` | 丢弃上下文，开启全新会话 |
-| `/model` `/模型` | 查看本地可用模型；`/model 序号`、`/model 模型id` 或 `/model provider/model` 切换（仅当前聊天生效，`/new` 后回到默认） |
+| `/model` `/模型` | 查看本地可用模型；`/model 序号`、`/model 模型id` 或 `/model provider/model` 切换（仅当前聊天生效，`/new` 后回到默认；Web UI 会话页同步显示） |
 
 其余消息作为用户输入交给 DSH Agent 处理。凭据约 24 小时过期（腾讯策略），到期后侧边栏微信入口变灰，点开重新扫码即可。
 
@@ -106,11 +106,11 @@ dsh web                          # 默认 http://127.0.0.1:3080
 ```shell
 npm install
 npm run typecheck   # 对官方 rc 类型的类型检查
-npm test            # 38 个单元测试（协议层走 mock 传输）
+npm test            # 46 个单元测试（协议层走 mock 传输）
 npm run build       # 产出 lib/（含 web 客户端 bundle）
 ```
 
-测试覆盖：文本切分与 send-file 指令提取、AES-128-ECB 媒体加解密往返、白名单默认拒绝、状态文件读写与损坏拒绝、iLink 长轮询/发送/打字/媒体上传全流程（mock fetch）、扫码登录状态机（含区域重定向与验证码）。
+测试覆盖：文本切分与 send-file 指令提取、AES-128-ECB 媒体加解密往返、白名单默认拒绝、状态文件读写与损坏拒绝、iLink 长轮询/发送/打字/媒体上传全流程（mock fetch）、扫码登录状态机（含区域重定向与验证码）、`/model` 命令匹配逻辑（序号/id/provider-model 多形态）。
 
 ## 已知限制
 
