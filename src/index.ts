@@ -176,6 +176,14 @@ class WechatGateway {
   readonly #ownerChatId: string | undefined
   /** 本地模型目录缓存（30 秒 TTL，避免连续 /model 反复询问 provider）。 */
   #catalog?: { at: number; models: ModelEntry[] }
+  /** 通道健康度：连续轮询失败 3 次即判失效（凭据过期/断网），成功即恢复。 */
+  #consecutiveFailures = 0
+  #channelHealthy = true
+
+  /** 通道当前是否可用（供连接状态展示与 wechat_notify 前置检查）。 */
+  get channelHealthy(): boolean {
+    return this.#channelHealthy
+  }
 
   constructor(ctx: Context, config: Config, connection: { token: string; accountId?: string; apiBase: string; ownerChatId?: string }, store: GatewayStateStore) {
     this.#ctx = ctx
@@ -198,6 +206,7 @@ class WechatGateway {
   /** 供 wechat_notify 工具调用：把文本主动推送到登录账号的微信。 */
   async notifyOwner(text: string, signal?: AbortSignal): Promise<void> {
     if (this.#ownerChatId === undefined) throw new Error('未记录登录账号的微信 id（可能使用环境变量 token 启动），无法主动推送')
+    if (!this.#channelHealthy) throw new Error('微信连接已失效（凭据过期或网络中断）：请重新扫码后再试')
     for (const chunk of splitText(text, this.#config.maxMessageChars)) {
       await this.#sendWithRetry(this.#ownerChatId, chunk, signal)
     }
@@ -400,10 +409,18 @@ class WechatGateway {
     while (!this.#abort.signal.aborted) {
       try {
         const messages = await this.#client.poll(this.#abort.signal)
+        this.#consecutiveFailures = 0
+        if (!this.#channelHealthy) this.#log('通道已恢复。')
+        this.#channelHealthy = true
         for (const message of messages) await this.#receive(message)
         if (messages.length === 0) await sleep(this.#config.emptyPollDelayMs, this.#abort.signal)
       } catch (error) {
         if (this.#abort.signal.aborted) return
+        this.#consecutiveFailures += 1
+        if (this.#consecutiveFailures >= 3 && this.#channelHealthy) {
+          this.#channelHealthy = false
+          this.#log('通道连续失败，判定连接失效（凭据过期或网络中断）。')
+        }
         this.#log(`${error instanceof Error ? error.message : String(error)}`)
         await sleep(this.#config.retryDelayMs, this.#abort.signal)
       }
@@ -605,7 +622,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     credentialPath: config.credentialPath,
     apiBase: config.apiBase || undefined,
     onCredential: restartGateway,
-    connected: () => ({ connected: gateway !== undefined, account: gatewayAccount }),
+    connected: () => gateway === undefined
+      ? { state: 'disconnected' as const }
+      : gateway.channelHealthy
+        ? { state: 'connected' as const, ...(gatewayAccount === undefined ? {} : { account: gatewayAccount }) }
+        : { state: 'stale' as const },
   })
   await startGateway()
   if (gateway === undefined) process.stderr.write('wechat-gateway: 尚未登录微信。在 Harness Web UI 打开 /wechat-gateway/login 扫码，或运行 npx dsh-wechat-gateway login。\n')

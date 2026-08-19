@@ -17,8 +17,8 @@ interface LoginRouteOptions {
   apiBase?: string
   /** 登录成功后的回调（重启网关）。 */
   onCredential: () => Promise<void>
-  /** 网关连接状态查询（供 /api/state 报告已连接态）。 */
-  connected?: () => { connected: boolean; account?: string }
+  /** 网关连接状态（三态）：connected 通道可用；stale 网关在跑但通道已失效（凭据过期/断网）；disconnected 未登录。 */
+  connected?: () => { state: 'connected' | 'stale' | 'disconnected'; account?: string }
 }
 
 interface StatusResult {
@@ -175,7 +175,12 @@ export function mountLoginRoute(ctx: Context, options: LoginRouteOptions): void 
   /** /api/state：侧边栏状态组件的机读视图（纯缓存读，不触碰长轮询）。 */
   const apiState = async (start: boolean): Promise<Record<string, unknown>> => {
     const connection = options.connected?.()
-    if (connection?.connected === true) return { status: 'connected', ...(connection.account === undefined ? {} : { account: connection.account }) }
+    if (connection?.state === 'connected') return { status: 'connected', ...(connection.account === undefined ? {} : { account: connection.account }) }
+    if (connection?.state === 'stale') {
+      // 凭据已失效：旧登录会话一并作废，引导用户重新扫码。
+      session = undefined
+      return { status: 'logged-out', qr: null, message: '连接已失效（凭据过期或网络中断），点击重新获取二维码。' }
+    }
     await beginSession(start)
     return {
       status: 'logged-out',
