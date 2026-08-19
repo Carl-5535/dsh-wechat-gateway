@@ -176,8 +176,8 @@ export function mountLoginRoute(ctx: Context, options: LoginRouteOptions): void 
   const apiState = async (start: boolean): Promise<Record<string, unknown>> => {
     const connection = options.connected?.()
     if (connection?.state === 'connected') return { status: 'connected', ...(connection.account === undefined ? {} : { account: connection.account }) }
-    if (connection?.state === 'stale') {
-      // 凭据已失效：旧登录会话一并作废，引导用户重新扫码。
+    // stale（凭据过期/断网）时提示重扫，但 start=1 是用户显式要新码，必须放行。
+    if (connection?.state === 'stale' && !start) {
       session = undefined
       return { status: 'logged-out', qr: null, message: '连接已失效（凭据过期或网络中断），点击重新获取二维码。' }
     }
