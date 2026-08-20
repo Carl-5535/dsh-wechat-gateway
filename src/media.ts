@@ -139,6 +139,42 @@ export function extractFileDirectives(text: string): { text: string; files: stri
   return { text: output, files }
 }
 
+/** 路径段允许的字符（含空格与波浪号；不含引号、括号、冒号与中西文标点）。 */
+const PATH_SEGMENT = '[\\p{L}\\p{N}\\-_. ~]'
+/** Windows 盘符绝对路径（结尾须带扩展名）。 */
+const WINDOWS_PATH = new RegExp(`[A-Za-z]:[\\\\/](${PATH_SEGMENT}+[\\\\/])*${PATH_SEGMENT}+\\.[A-Za-z0-9]{1,10}`, 'gu')
+/** POSIX 绝对路径（排除 URL：其起始斜杠前面是冒号或另一个斜杠）。 */
+const POSIX_PATH = new RegExp(`(?<![A-Za-z]:|[\\\\/])/((${PATH_SEGMENT}+/)*${PATH_SEGMENT}+)\\.[A-Za-z0-9]{1,10}`, 'gu')
+
+/**
+ * 提取正文中提及的本地文件绝对路径（Windows 盘符或 POSIX），按出现顺序去重。
+ * 只认带扩展名的路径；URL、代码标识符、目录路径不匹配。命中后仍需通过
+ * 存在性与工作区边界校验才会真正外发。
+ */
+export function detectLocalFilePaths(text: string): string[] {
+  // 先剔除 URL 整段，避免把网址里的路径部分误当作本地文件（如 https://host/a.png）。
+  const withoutUrls = text.replace(/https?:\/\/[^\s"'“”‘’）)】]+/gu, '')
+  const seen = new Set<string>()
+  const found: string[] = []
+  for (const match of withoutUrls.matchAll(WINDOWS_PATH)) {
+    const path = match[0]
+    const key = path.toLowerCase()
+    if (!seen.has(key)) {
+      seen.add(key)
+      found.push(path)
+    }
+  }
+  for (const match of withoutUrls.matchAll(POSIX_PATH)) {
+    const path = match[0]
+    const key = path.toLowerCase()
+    if (!seen.has(key)) {
+      seen.add(key)
+      found.push(path)
+    }
+  }
+  return found
+}
+
 /** 按字符（而非 UTF-16 码元）切分，避免把 emoji / 生僻字劈成两半。 */
 export function splitText(text: string, limit: number): string[] {
   const characters = Array.from(text)

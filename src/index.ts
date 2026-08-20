@@ -18,12 +18,13 @@ import type { SessionEvent, JsonValue } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-llm'
+import type { ApprovalRequest, ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { ILinkClient, type InboundMessage } from './ilink.js'
 import { defaultCredentialPath, pathExists, readCredential } from './store.js'
 import { defaultStatePath, GatewayStateStore, loadGatewayState } from './state.js'
 import { contentUserMessage, installSelection, sessionId } from './harness.js'
-import { extractFileDirectives, resolveWorkspaceFile, saveInboundMedia, splitText } from './media.js'
+import { extractFileDirectives, resolveWorkspaceFile, saveInboundMedia, splitText, detectLocalFilePaths } from './media.js'
 import { mountLoginRoute } from './web-login.js'
 
 /** Cordis 插件名（稳定标识）。 */
@@ -47,6 +48,17 @@ export interface Config {
   emptyPollDelayMs: number
   maxMessageChars: number
   maxMediaBytes: number
+  /** 回复正文提及的工作区内文件是否自动回发（显式 [[send-file]] 不受此开关影响）。 */
+  autoSendMentionedFiles: boolean
+}
+
+/**
+ * 解析 WECHAT_AUTO_SEND_FILES：未设置时返回 undefined（走 schema 默认开启）；
+ * 设为 0/false/off/no（忽略大小写）关闭，其余任意值开启。
+ */
+function autoSendFromEnv(raw: string | undefined): boolean | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined
+  return !/^(0|false|off|no)$/i.test(raw.trim())
 }
 
 export const Config: z<Config> = z.object({
@@ -64,6 +76,7 @@ export const Config: z<Config> = z.object({
   emptyPollDelayMs: z.number().min(10).default(250),
   maxMessageChars: z.number().min(100).max(10_000).default(3_500),
   maxMediaBytes: z.number().min(1_024).max(512 * 1024 * 1024).default(100 * 1024 * 1024),
+  autoSendMentionedFiles: z.boolean().default(autoSendFromEnv(process.env.WECHAT_AUTO_SEND_FILES) ?? true),
 })
 
 /** 白名单判定：单聊需发送者在 allowedUsers；群聊还需群在 allowedGroups。 */
@@ -96,6 +109,13 @@ interface ChatState {
   sentThroughSeq: number
   delivery: Promise<void>
   typing: Promise<void>
+}
+
+/** 一条送达微信、等待答复的审批请求。 */
+interface PendingApproval {
+  toolName: string
+  reason?: string
+  settle: (action: ApprovalReplyAction) => void
 }
 
 /** 本地模型目录的一个条目（provider + 模型）。 */
@@ -134,8 +154,83 @@ interface AgentPresetService {
   mount(agentCtx: Context): Promise<unknown>
 }
 
-interface PermissionPresetService {
+/** permissionPresets 服务暴露的预设选项（客户端渲染用）。 */
+export interface PresetOption {
+  value: string
+  name: string
+  description?: string
+}
+
+/** permissionPresets 服务的一个预设捆绑（沙箱模式 + 审批策略）。 */
+export interface PresetSpec {
+  sandbox: string
+  approval: 'ask' | 'never'
+  name?: string
+  description?: string
+}
+
+/** dsh-permission-presets 的服务面（本地最小声明，与官方 rc 类型结构一致）。 */
+export interface PermissionPresetService {
+  /** 预设表声明顺序的全部可切换预设名。 */
+  readonly names: readonly string[]
+  /** 新会话的默认预设。 */
+  readonly defaultPreset: string
+  /** 从会话事件折叠出实际生效的预设（含派生的 'custom'）。 */
+  current(events: readonly SessionEvent[]): string
+  /** 解析预设的旋钮捆绑；未知名称抛错。 */
+  resolve(name: string): PresetSpec
+  /** 构建某个预设（或 'custom'）的展示选项；未知名称抛错。 */
+  optionOf(name: string): PresetOption
+  /** 切换预设：记录意图事件并经各旋钮规范 setter 写入。 */
   set(session: Agent['session'], name: string): void
+}
+
+/** 微信里对审批请求的一条答复动作：放行/驳回，或转交网页端。 */
+export type ApprovalReplyAction = ApprovalOutcome | 'web'
+
+/** 触发同意的答复词（小写比较，中文原样）。 */
+const APPROVAL_YES_WORDS = new Set(['同意', '允许', '批准', '好', '好的', '同意执行', 'yes', 'y', 'ok', '1'])
+/** 触发拒绝的答复词。 */
+const APPROVAL_NO_WORDS = new Set(['拒绝', '不同意', '不允许', '不要', '否', '不', 'no', 'n', '0'])
+/** 触发转交网页端审批面板的答复词。 */
+const APPROVAL_WEB_WORDS = new Set(['网页', 'web', '转网页'])
+
+/**
+ * 解析微信里对审批请求的答复：认可词 → 'allowed-once'，拒绝词 → 'rejected'，
+ * 转交词 → 'web'，其他内容（含空文本）→ undefined（按普通消息处理）。
+ */
+export function parseApprovalReply(text: string): ApprovalReplyAction | undefined {
+  const normalized = text.trim().toLowerCase()
+  if (normalized === '') return undefined
+  if (APPROVAL_YES_WORDS.has(normalized)) return 'allowed-once'
+  if (APPROVAL_NO_WORDS.has(normalized)) return 'rejected'
+  if (APPROVAL_WEB_WORDS.has(normalized)) return 'web'
+  return undefined
+}
+
+/** 内置预设的中文别名（仅当该预设存在于表中时生效）。 */
+const PRESET_ALIASES: Record<string, readonly string[]> = {
+  'workspace-write': ['保守', '安全', '写工作区'],
+  'danger-full-access': ['完全', '全开', '放开', '危险', '完全访问'],
+}
+
+/**
+ * /permission 的预设匹配：序号（从 1 起）、完整名称（忽略大小写）、内置中文别名
+ * 或唯一前缀。返回 undefined 表示没有匹配，multiple 表示歧义。
+ */
+export function matchPresetName(names: readonly string[], input: string): string | 'multiple' | undefined {
+  const query = input.trim()
+  if (query === '') return undefined
+  if (/^\d+$/.test(query)) return names[Number(query) - 1]
+  const lower = query.toLowerCase()
+  const exact = names.find(name => name.toLowerCase() === lower)
+  if (exact !== undefined) return exact
+  const alias = names.find(name => (PRESET_ALIASES[name] ?? []).includes(query))
+  if (alias !== undefined) return alias
+  const byPrefix = names.filter(name => name.toLowerCase().startsWith(lower))
+  if (byPrefix.length === 1) return byPrefix[0]
+  if (byPrefix.length > 1) return 'multiple'
+  return undefined
 }
 
 interface SessionTitleService {
@@ -160,7 +255,9 @@ const HELP_TEXT = [
   '  /stop 或 /停止 —— 中止当前任务',
   '  /new 或 /新会话 —— 开启全新会话（丢弃当前上下文）',
   '  /model 或 /模型 —— 查看可用模型；/model 序号或模型id 切换（仅本聊天生效）',
+  '  /permission 或 /权限 —— 查看权限模式；/permission 序号或名称切换（仅本聊天生效）',
   '发给我的图片/文件会保存到工作区；我可以用 [[send-file:路径]] 把工作区文件发回给你。',
+  '当我请求越权操作时会推送审批请求：回复「同意」或「拒绝」处理，回复「网页」转到网页端审批面板。',
 ].join('\n')
 
 class WechatGateway {
@@ -179,6 +276,12 @@ class WechatGateway {
   /** 通道健康度：连续轮询失败 3 次即判失效（凭据过期/断网），成功即恢复。 */
   #consecutiveFailures = 0
   #channelHealthy = true
+  /** 每聊天当前等待微信答复的审批（一次最多一条；后续请求排队投递）。 */
+  readonly #pendingApprovals = new Map<string, PendingApproval>()
+  /** 每聊天的审批问题投递链：串行化多个并发审批的微信提问。 */
+  readonly #approvalAskChain = new Map<string, Promise<void>>()
+  /** start() 注册的 ctx 监听器注销函数（重新扫码重启网关时清理，避免残留）。 */
+  readonly #listeners: Array<() => void> = []
 
   /** 通道当前是否可用（供连接状态展示与 wechat_notify 前置检查）。 */
   get channelHealthy(): boolean {
@@ -215,15 +318,15 @@ class WechatGateway {
   start(): void {
     // Agent 被释放（如 Web UI 关闭会话）时清理内存映射；
     // 持久映射保留，下一条消息会 resume 既有会话。
-    this.#ctx.on('agent/disposed', ({ agent }) => {
+    this.#listeners.push(this.#ctx.on('agent/disposed', ({ agent }) => {
       const chatId = this.#agentChats.get(agent)
       if (chatId === undefined) return
       this.#agentChats.delete(agent)
       const state = this.#chats.get(chatId)
       if (state?.handle.agent === agent) this.#chats.delete(chatId)
-    })
+    }))
     // 每轮结束：把助手回复送回微信（串行排队，防止交错）。
-    this.#ctx.on('session/event', (session, event) => {
+    this.#listeners.push(this.#ctx.on('session/event', (session, event) => {
       if (event.type !== 'turn/end') return
       const agent = this.#ctx.agents.get(session.id)
       if (agent === undefined) return
@@ -239,7 +342,15 @@ class WechatGateway {
         .catch((error: unknown) => {
           if (!this.#abort.signal.aborted) this.#log(`投递失败: ${error instanceof Error ? error.message : String(error)}`)
         })
-    })
+    }))
+    // 审批应答（waterfall，prepend 保证 OUTER）：微信绑定的 Agent 发起审批时
+    // 问题先只发微信（串行）；回复「网页」或通道失效再转交 Web UI 面板，避免
+    // 面板显示后从他处结算导致僵死。其余 Agent 的请求原样透传。
+    this.#listeners.push(this.#ctx.on('approval/request', async (req, next) => {
+      const chatId = this.#agentChats.get(req.agent)
+      if (chatId === undefined || !this.#channelHealthy) return await next()
+      return await this.#approvalViaWechat(chatId, req, next)
+    }, true))
     void this.#startLoop().catch((error: unknown) => {
       if (!this.#abort.signal.aborted) this.#log(`网关停止: ${error instanceof Error ? error.message : String(error)}`)
     })
@@ -252,6 +363,7 @@ class WechatGateway {
 
   async dispose(): Promise<void> {
     this.#abort.abort()
+    for (const dispose of this.#listeners.splice(0)) dispose()
     await Promise.all([...this.#chats.values()].map(async state => { await state.handle.dispose() }))
   }
 
@@ -270,7 +382,8 @@ class WechatGateway {
     }
     const delivery = extractFileDirectives(output.text)
     const chunks = delivery.text === '' ? [] : splitText(delivery.text, this.#config.maxMessageChars)
-    this.#store.state.outbox[chatId] = { chunks, files: delivery.files, next: 0, nextFile: 0 }
+    const mentioned = this.#config.autoSendMentionedFiles ? await this.#collectMentionedFiles(delivery.text, delivery.files) : []
+    this.#store.state.outbox[chatId] = { chunks, files: [...delivery.files, ...mentioned], next: 0, nextFile: 0 }
     await this.#store.save()
     await this.#drainOutbox(chatId)
     // 全部送达才推进 sentThroughSeq：中途崩溃重启后会重发该轮回复，
@@ -283,6 +396,28 @@ class WechatGateway {
       if (this.#abort.signal.aborted) return
       await this.#drainOutbox(chatId)
     }
+  }
+
+  /**
+   * 收集回复正文提及、可自动回发的本地文件：只保留存在、位于工作区内且
+   * 未超限的路径（提及≠指令，越界/缺失静默跳过），单条回复最多 5 个防刷屏。
+   */
+  async #collectMentionedFiles(text: string, explicit: readonly string[]): Promise<string[]> {
+    const explicitSet = new Set(explicit.map(path => path.toLowerCase()))
+    const found: string[] = []
+    for (const path of detectLocalFilePaths(text)) {
+      if (found.length >= 5) break
+      const key = path.toLowerCase()
+      if (explicitSet.has(key) || found.some(existing => existing.toLowerCase() === key)) continue
+      try {
+        await resolveWorkspaceFile(this.#config.workspace, path, this.#config.maxMediaBytes)
+        found.push(path)
+      } catch {
+        // 提及的路径不存在、不在工作区内或超限：不视为发送请求，静默跳过
+        this.#log(`跳过正文提及的文件 ${path}（不存在、不在工作区内或超过大小限制）`)
+      }
+    }
+    return found
   }
 
   async #drainOutbox(chatId: string): Promise<void> {
@@ -405,6 +540,88 @@ class WechatGateway {
     await this.#sendWithRetry(chatId, `已切换到 ${chosen.name}（${chosen.provider}/${chosen.id}），下一条消息生效。`)
   }
 
+  /**
+   * 审批 answerer 主体（串行，微信优先）。问题只发微信：回复认可/拒绝词
+   * 直接认领；回复「网页」、通道中途失效或任务中止时调用 next() 转交后续
+   * 应答者（Web UI 审批面板）——面板的待审批表项只能由浏览器响应或中止
+   * 信号清除，因此绝不能在它已显示后又从他处结算，否则面板会僵死。
+   */
+  async #approvalViaWechat(chatId: string, req: ApprovalRequest, next: () => Promise<ApprovalOutcome>): Promise<ApprovalOutcome> {
+    const pending: PendingApproval = { toolName: req.toolName, reason: req.reason, settle: () => undefined }
+    const answer = new Promise<ApprovalReplyAction>(resolve => { pending.settle = resolve })
+    const questionAbort = new AbortController()
+    const chain = this.#approvalAskChain.get(chatId) ?? Promise.resolve()
+    const delivered = chain
+      .then(async () => {
+        this.#pendingApprovals.set(chatId, pending)
+        const lines = ['🔐 Agent 请求审批', `工具：${req.toolName}`]
+        if (req.reason !== undefined && req.reason !== '') lines.push(`原因：${req.reason}`)
+        lines.push('回复「同意」或「拒绝」；也可以回复「网页」转到网页端审批面板处理。')
+        const signal = req.signal === undefined ? questionAbort.signal : AbortSignal.any([req.signal, questionAbort.signal])
+        await this.#sendWithRetry(chatId, lines.join('\n'), signal)
+      })
+      .catch(() => undefined) // 提问投递失败不阻断：看门狗发现通道失效后会转交网页端
+    this.#approvalAskChain.set(chatId, delivered)
+    const action = await new Promise<ApprovalReplyAction | undefined>(resolve => {
+      let timer: ReturnType<typeof setInterval> | undefined
+      let done = false
+      const finish = (value: ApprovalReplyAction | undefined): void => {
+        if (done) return
+        done = true
+        if (timer !== undefined) clearInterval(timer)
+        resolve(value)
+      }
+      // 看门狗：等待期间通道判死（凭据过期/断网）即转交，避免问题永远无人应答。
+      timer = setInterval(() => { if (!this.#channelHealthy) finish(undefined) }, 30_000)
+      ;(timer as { unref?: () => void }).unref?.()
+      answer.then(action => finish(action))
+      // 任务中止撤销请求：转交后续应答者（对已中止的请求它们同步返回 cancelled）。
+      req.signal?.addEventListener('abort', () => finish(undefined), { once: true })
+    })
+    questionAbort.abort()
+    if (this.#pendingApprovals.get(chatId) === pending) this.#pendingApprovals.delete(chatId)
+    if (action === undefined) return await next()
+    if (action === 'web') return await next()
+    return action
+  }
+
+  /** /permission：无参列出权限模式并标记当前项；带参切换本聊天的模式。 */
+  async #permissionCommand(chatId: string, rest: string): Promise<void> {
+    const presets = this.#ctx.get('permissionPresets') as PermissionPresetService | undefined
+    if (presets === undefined) {
+      await this.#sendWithRetry(chatId, '当前环境未提供 permissionPresets 服务，无法查看或切换权限模式。')
+      return
+    }
+    const state = this.#chats.get(chatId)
+    const names = [...presets.names]
+    if (rest === '') {
+      const currentName = state === undefined ? presets.defaultPreset : presets.current(state.handle.agent.session.events)
+      const lines = ['权限模式（✅ 为当前，切换仅对本聊天生效）：']
+      names.forEach((name, index) => {
+        const spec = presets.resolve(name)
+        const mark = name === currentName ? ' ✅' : ''
+        lines.push(`${index + 1}. ${spec.name ?? name}（${spec.sandbox} + ${spec.approval === 'ask' ? '越界需审批' : '不审批'}）${mark}`)
+      })
+      if (currentName === 'custom') lines.push('（当前为自定义组合，不匹配任何预设）')
+      lines.push('切换：/permission 序号或名称（如 /permission 1）')
+      await this.#sendWithRetry(chatId, lines.join('\n'))
+      return
+    }
+    const chosen = matchPresetName(names, rest)
+    if (chosen === 'multiple') {
+      await this.#sendWithRetry(chatId, `「${rest}」匹配到多个权限模式，请用 /permission 序号或完整名称指定。`)
+      return
+    }
+    if (chosen === undefined) {
+      await this.#sendWithRetry(chatId, `没有匹配「${rest}」的权限模式，发送 /permission 查看列表。`)
+      return
+    }
+    const chat = state ?? await this.#chat(chatId)
+    presets.set(chat.handle.agent.session, chosen)
+    const spec = presets.resolve(chosen)
+    await this.#sendWithRetry(chatId, `已切换到 ${spec.name ?? chosen}（${spec.sandbox} + ${spec.approval === 'ask' ? '越界需审批' : '不审批'}），立即生效。`)
+  }
+
   async #pollLoop(): Promise<void> {
     while (!this.#abort.signal.aborted) {
       try {
@@ -463,6 +680,28 @@ class WechatGateway {
       await this.#modelCommand(message.chatId, rest)
       return
     }
+    if (command === '/permission' || command === '/权限' || message.text.trim().startsWith('/permission ') || message.text.trim().startsWith('/权限 ')) {
+      const rest = message.text.trim().replace(/^\/(?:permission|权限)\s*/u, '').trim()
+      await this.#permissionCommand(message.chatId, rest)
+      return
+    }
+    // 待审批时的答复拦截：认可/拒绝词消费为审批结果，「网页」转交网页端，
+    // 其余消息照常交给 Agent（附一条待办提醒，避免用户忘记还有审批挂着）。
+    const approval = this.#pendingApprovals.get(message.chatId)
+    if (approval !== undefined) {
+      const action = parseApprovalReply(message.text)
+      if (action !== undefined) {
+        this.#pendingApprovals.delete(message.chatId)
+        if (action === 'web') {
+          await this.#sendWithRetry(message.chatId, '↗️ 已转到网页端审批面板，请在网页端处理。')
+        } else {
+          await this.#sendWithRetry(message.chatId, action === 'allowed-once' ? '✅ 已同意，继续执行。' : '⛔ 已拒绝该操作。')
+        }
+        approval.settle(action)
+        return
+      }
+      await this.#sendWithRetry(message.chatId, `⏳ 有一条审批等待答复（工具：${approval.toolName}）：回复「同意」或「拒绝」，回复「网页」转网页端，或发 /stop 中止任务。`)
+    }
     const state = await this.#chat(message.chatId)
     const blocks: Parameters<typeof contentUserMessage>[0] = []
     if (message.text !== '') blocks.push({ type: 'text', text: message.text })
@@ -501,7 +740,8 @@ class WechatGateway {
       '本会话与一个微信聊天相连，同时可在 Harness Web UI 中查看。',
       '从微信收到的文件保存在工作区内，用户消息中会列出绝对路径。',
       '要把工作区文件发回微信，在最终回复中单独一行写指令：[[send-file:relative/or/absolute/path]]。',
-      '仅当用户明确要求或确有必要时才请求发送文件；该指令会从送达微信的文本中移除。',
+      '此外，回复正文中提及的工作区内既有文件路径会自动发送给用户，无需额外指令。',
+      '仅当用户明确要求或确有必要时才发送文件；显式指令行会从送达微信的文本中移除。',
       '回复将原样送达微信（纯文本），避免使用依赖渲染的复杂 Markdown 表格。',
       '你的回复会自动送达微信，无需对本会话调用 wechat_notify；该工具供其他会话主动推送使用。',
     ].join('\n')

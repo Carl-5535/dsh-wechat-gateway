@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   classifyOutbound,
   decryptMedia,
+  detectLocalFilePaths,
   encryptMedia,
   extractFileDirectives,
   paddedSize,
@@ -51,6 +52,46 @@ describe('extractFileDirectives', () => {
     const result = extractFileDirectives('前缀 [[send-file:x.txt]] 后缀')
     expect(result.files).toEqual([])
     expect(result.text).toContain('[[send-file:x.txt]]')
+  })
+})
+
+describe('detectLocalFilePaths（正文提及的本地文件）', () => {
+  it('Windows 盘符路径（含空格与中文标点语境）', () => {
+    const text = '已生成图标：\n本地文件: C:\\Users\\carl.chen.TRTECH\\dsh-weixin-gateway-icon.png，请查收。'
+    expect(detectLocalFilePaths(text)).toEqual(['C:\\Users\\carl.chen.TRTECH\\dsh-weixin-gateway-icon.png'])
+  })
+
+  it('含空格的路径整体匹配', () => {
+    const text = '结果在 C:\\Users\\John Smith\\my report.pdf 这里'
+    expect(detectLocalFilePaths(text)).toEqual(['C:\\Users\\John Smith\\my report.pdf'])
+  })
+
+  it('POSIX 绝对路径', () => {
+    expect(detectLocalFilePaths('输出：/home/alice/out/report.md 已就绪')).toEqual(['/home/alice/out/report.md'])
+  })
+
+  it('URL 不匹配（协议与域名部分不当作路径）', () => {
+    const text = '图标 URL: https://platform-outputs.agnes-ai.space/images/t2i/275baa6aab3a45ffa191356ca7bec48c.png'
+    expect(detectLocalFilePaths(text)).toEqual([])
+  })
+
+  it('无扩展名或目录不匹配', () => {
+    expect(detectLocalFilePaths('日志目录是 D:\\logs\\today 而非 D:\\logs')).toEqual([])
+    expect(detectLocalFilePaths('盘符 C:\\ 本身')).toEqual([])
+  })
+
+  it('同一路径去重、多路径按序返回', () => {
+    const text = 'C:\\a\\x.png 与 C:\\a\\x.png，还有 /tmp/b.txt'
+    expect(detectLocalFilePaths(text)).toEqual(['C:\\a\\x.png', '/tmp/b.txt'])
+  })
+
+  it('大小写不同的写法视为同一路径', () => {
+    expect(detectLocalFilePaths('C:\\Out\\A.png 与 c:\\out\\a.png')).toEqual(['C:\\Out\\A.png'])
+  })
+
+  it('引号与括号内的路径可提取，行尾句号不并入', () => {
+    const text = '见 "C:\\out\\图标.png".（另见 /tmp/z.jpeg）'
+    expect(detectLocalFilePaths(text)).toEqual(['C:\\out\\图标.png', '/tmp/z.jpeg'])
   })
 })
 
