@@ -27,6 +27,8 @@ export interface GatewayState {
   seenMessageIds: string[]
   protocol: ILinkState
   outbox: Record<string, OutboxItem>
+  /** 运行时覆盖的工作目录（空串或缺失时回退到 config.workspace）。 */
+  workspace?: string
 }
 
 export function defaultStatePath(): string {
@@ -34,7 +36,7 @@ export function defaultStatePath(): string {
 }
 
 function emptyState(): GatewayState {
-  return { version: STATE_VERSION, chats: {}, seenMessageIds: [], protocol: { updatesBuffer: '', contextTokens: {} }, outbox: {} }
+  return { version: STATE_VERSION, chats: {}, seenMessageIds: [], protocol: { updatesBuffer: '', contextTokens: {} }, outbox: {}, workspace: undefined }
 }
 
 function asRecord(value: unknown, field: string): Record<string, unknown> {
@@ -82,6 +84,7 @@ export async function loadGatewayState(path: string): Promise<GatewayState> {
     seenMessageIds: [...value.seenMessageIds],
     protocol: { updatesBuffer: protocolSource.updatesBuffer, contextTokens },
     outbox,
+    workspace: typeof value.workspace === 'string' ? value.workspace : undefined,
   }
 }
 

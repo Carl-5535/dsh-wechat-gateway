@@ -288,6 +288,18 @@ class WechatGateway {
     return this.#channelHealthy
   }
 
+  /** 当前生效的工作目录：运行时覆盖优先，否则回退到配置默认值。 */
+  get workspace(): string {
+    return this.#store.state.workspace || this.#config.workspace
+  }
+
+  /** 设置并持久化运行时工作目录（传空串清除覆盖、回退到配置默认值）。 */
+  async setWorkspace(path: string): Promise<void> {
+    this.#store.state.workspace = path || undefined
+    await this.#store.save()
+    this.#log(`工作目录已更新：${this.workspace}`)
+  }
+
   constructor(ctx: Context, config: Config, connection: { token: string; accountId?: string; apiBase: string; ownerChatId?: string }, store: GatewayStateStore) {
     this.#ctx = ctx
     this.#config = config
@@ -410,7 +422,7 @@ class WechatGateway {
       const key = path.toLowerCase()
       if (explicitSet.has(key) || found.some(existing => existing.toLowerCase() === key)) continue
       try {
-        await resolveWorkspaceFile(this.#config.workspace, path, this.#config.maxMediaBytes)
+        await resolveWorkspaceFile(this.workspace, path, this.#config.maxMediaBytes)
         found.push(path)
       } catch {
         // 提及的路径不存在、不在工作区内或超限：不视为发送请求，静默跳过
@@ -432,7 +444,7 @@ class WechatGateway {
     while (item.nextFile < item.files.length && !this.#abort.signal.aborted) {
       const requested = item.files[item.nextFile]!
       try {
-        const file = await resolveWorkspaceFile(this.#config.workspace, requested, this.#config.maxMediaBytes)
+        const file = await resolveWorkspaceFile(this.workspace, requested, this.#config.maxMediaBytes)
         await this.#sendMediaWithRetry(chatId, file.name, file.bytes)
       } catch (error) {
         if (this.#abort.signal.aborted) return
@@ -706,7 +718,7 @@ class WechatGateway {
     const blocks: Parameters<typeof contentUserMessage>[0] = []
     if (message.text !== '') blocks.push({ type: 'text', text: message.text })
     const paths: string[] = []
-    const mediaRoot = this.#config.mediaDir || `${this.#config.workspace}/.wechat-gateway/inbox`
+    const mediaRoot = this.#config.mediaDir || `${this.workspace}/.wechat-gateway/inbox`
     for (const media of message.media) {
       const path = await saveInboundMedia(mediaRoot, message.chatId, media)
       paths.push(path)
@@ -798,7 +810,7 @@ class WechatGateway {
   async #createAgent(selection: { provider: string; model: string }, setup: (agentCtx: Context) => Promise<void>): Promise<AgentHandle> {
     return await this.#ctx.agents.create({
       sessionId: sessionId(`wechat-${randomUUID()}`),
-      meta: { cwd: this.#config.workspace },
+      meta: { cwd: this.workspace },
       agentOptions: selection,
       setup,
     })
@@ -874,6 +886,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       : gateway.channelHealthy
         ? { state: 'connected' as const, ...(gatewayAccount === undefined ? {} : { account: gatewayAccount }) }
         : { state: 'stale' as const },
+    workspace: () => gateway?.workspace ?? config.workspace,
+    setWorkspace: async (path) => {
+      if (gateway !== undefined) await gateway.setWorkspace(path)
+    },
   })
   await startGateway()
   if (gateway === undefined) process.stderr.write('wechat-gateway: 尚未登录微信。在 Harness Web UI 打开 /wechat-gateway/login 扫码，或运行 npx dsh-wechat-gateway login。\n')

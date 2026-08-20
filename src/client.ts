@@ -71,9 +71,48 @@ function WeChatStatusButton(props: FooterActionFace) {
   const [code, setCode] = useState('')
   const buttonRef = useRef<HTMLButtonElement | null>(null)
   const [anchor, setAnchor] = useState<{ left: number; bottom: number } | null>(null)
+  const [workspace, setWorkspace] = useState('')
+  const [editingWorkspace, setEditingWorkspace] = useState(false)
+  const [browsePath, setBrowsePath] = useState('')
+  const [browseEntries, setBrowseEntries] = useState<string[]>([])
+  const [browseParent, setBrowseParent] = useState<string | null>(null)
 
   const load = (start = false): void => {
     void fetch(`/wechat-gateway/api/state${start ? '?start=1' : ''}`).then(async response => setState(await response.json() as StateResponse)).catch(() => undefined)
+  }
+
+  const loadWorkspace = (): void => {
+    void fetch('/wechat-gateway/api/workspace').then(async r => {
+      const data = await r.json() as { workspace?: string }
+      setWorkspace(data.workspace ?? '')
+    }).catch(() => undefined)
+  }
+
+  const loadBrowse = (path: string): void => {
+    void fetch(`/wechat-gateway/api/browse?path=${encodeURIComponent(path)}`).then(async r => {
+      const data = await r.json() as { path?: string; parent?: string | null; entries?: string[]; error?: string }
+      if (data.error) return
+      setBrowsePath(data.path ?? '')
+      setBrowseParent(data.parent ?? null)
+      setBrowseEntries(data.entries ?? [])
+    }).catch(() => undefined)
+  }
+
+  const startEditing = (): void => {
+    setEditingWorkspace(true)
+    loadBrowse(workspace || '')
+  }
+
+  const selectDirectory = (): void => {
+    void fetch('/wechat-gateway/api/workspace', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspace: browsePath }),
+    }).then(async r => {
+      const data = await r.json() as { workspace?: string }
+      setWorkspace(data.workspace ?? browsePath)
+      setEditingWorkspace(false)
+    }).catch(() => undefined)
   }
 
   // 挂载即取一次状态；弹层打开时 1.5s 轮询推进登录状态机，关闭后 15s 轻量观察掉线。
@@ -95,6 +134,9 @@ function WeChatStatusButton(props: FooterActionFace) {
       const rect = buttonRef.current?.getBoundingClientRect()
       if (rect !== undefined) setAnchor({ left: rect.right + 12, bottom: window.innerHeight - rect.bottom + 4 })
       load()
+      loadWorkspace()
+    } else {
+      setEditingWorkspace(false)
     }
   }
 
@@ -155,7 +197,45 @@ function WeChatStatusButton(props: FooterActionFace) {
               createElement(StatusDot, { connected: true }),
               state?.account === undefined ? '已连接' : `已连接 · ${state.account}`),
             createElement('div', { style: { fontSize: 12.5, color: 'var(--dsw-alias-label-tertiary, #9a9a9f)', lineHeight: 1.6 } },
-              '在微信里直接给本账号发消息即可使用；发送 /help 查看命令。'))
+              '在微信里直接给本账号发消息即可使用；发送 /help 查看命令。'),
+            createElement('div', { style: { marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--dsw-alias-border-l2, #e3e3e6)' } },
+              createElement('div', { style: { fontSize: 11.5, color: 'var(--dsw-alias-label-tertiary, #9a9a9f)', marginBottom: 4 } }, '工作目录'),
+              editingWorkspace
+                ? createElement('div', null,
+                    createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9a9a9f)', marginBottom: 6, wordBreak: 'break-all' } }, browsePath || '(根目录)'),
+                    createElement('div', { style: { maxHeight: 200, overflowY: 'auto', border: '1px solid var(--dsw-alias-border-l2, #e3e3e6)', borderRadius: 6, marginBottom: 6 } },
+                      browseParent !== null ? createElement('div', {
+                        onClick: () => { loadBrowse(browseParent) },
+                        style: { padding: '6px 10px', fontSize: 12, cursor: 'pointer', borderBottom: '1px solid var(--dsw-alias-border-l2, #e3e3e6)', color: 'var(--dsw-alias-label-tertiary, #9a9a9f)' },
+                      }, '← 上级') : null,
+                      browseEntries.length === 0
+                        ? createElement('div', { style: { padding: '12px 10px', fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #9a9a9f)', textAlign: 'center' } }, '无子目录')
+                        : browseEntries.map(entry => createElement('div', {
+                            key: entry,
+                            onClick: () => {
+                              const next = browsePath === '' ? entry : (browsePath.endsWith('/') || browsePath.endsWith('\\') ? browsePath + entry : browsePath + (browsePath.includes('\\') ? '\\' : '/') + entry)
+                              loadBrowse(next)
+                            },
+                            style: { padding: '6px 10px', fontSize: 12, cursor: 'pointer', borderBottom: '1px solid var(--dsw-alias-border-l2, #e3e3e6)' },
+                          }, entry))),
+                    createElement('div', { style: { display: 'flex', gap: 6 } },
+                      createElement('button', {
+                        type: 'button',
+                        onClick: selectDirectory,
+                        style: { font: 'inherit', fontSize: 12, padding: '4px 10px', borderRadius: 6, border: 'none', background: WECHAT_GREEN, color: '#fff', cursor: 'pointer', flex: 1 },
+                      }, '选择此目录'),
+                      createElement('button', {
+                        type: 'button',
+                        onClick: () => { setEditingWorkspace(false) },
+                        style: { font: 'inherit', fontSize: 12, padding: '4px 8px', borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2, #e3e3e6)', background: 'transparent', color: 'inherit', cursor: 'pointer', flex: 'none' },
+                      }, '取消')))
+                : createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center', fontSize: 12.5 } },
+                    createElement('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, workspace || '默认'),
+                    createElement('button', {
+                      type: 'button',
+                      onClick: startEditing,
+                      style: { font: 'inherit', fontSize: 11.5, padding: '2px 8px', borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2, #e3e3e6)', background: 'transparent', color: 'var(--dsw-alias-label-tertiary, #9a9a9f)', cursor: 'pointer', flex: 'none' },
+                    }, '修改'))))
         : createElement('div', null,
             createElement('div', { style: { fontSize: 12.5, color: 'var(--dsw-alias-label-tertiary, #9a9a9f)', marginBottom: 10, textAlign: 'center' } },
               state?.message ?? '正在获取二维码…'),

@@ -8,6 +8,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { setTimeout as delay } from 'node:timers/promises'
+import { readdir, stat } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 import QRCode from 'qrcode'
 import { writePrivateJson } from './store.js'
 import { pollLoginSession, startLoginSession, type LoginSession } from './qrlogin.js'
@@ -19,6 +21,10 @@ interface LoginRouteOptions {
   onCredential: () => Promise<void>
   /** 网关连接状态（三态）：connected 通道可用；stale 网关在跑但通道已失效（凭据过期/断网）；disconnected 未登录。 */
   connected?: () => { state: 'connected' | 'stale' | 'disconnected'; account?: string }
+  /** 当前生效的工作目录。 */
+  workspace?: () => string
+  /** 更新运行时工作目录。 */
+  setWorkspace?: (path: string) => Promise<void>
 }
 
 interface StatusResult {
@@ -210,6 +216,69 @@ export function mountLoginRoute(ctx: Context, options: LoginRouteOptions): void 
             response.end(JSON.stringify(await apiState(start)))
           } catch (error) {
             response.writeHead(502).end(JSON.stringify({ status: 'logged-out', qr: null, message: `暂时无法连接：${error instanceof Error ? error.message : String(error)}` }))
+          }
+          return
+        }
+        if (path === '/wechat-gateway/api/workspace') {
+          response.setHeader('content-type', 'application/json; charset=utf-8')
+          if (request.method === 'POST') {
+            const body = await new Promise<string>((resolveBody) => {
+              const chunks: Buffer[] = []
+              request.on('data', (chunk: Buffer) => { chunks.push(chunk) })
+              request.on('end', () => { resolveBody(Buffer.concat(chunks).toString('utf8')) })
+            })
+            let parsed: { workspace?: string } = {}
+            try { parsed = JSON.parse(body) as { workspace?: string } } catch { /* empty body → reset */ }
+            const value = typeof parsed.workspace === 'string' ? parsed.workspace.trim() : ''
+            try {
+              await options.setWorkspace?.(value)
+              response.end(JSON.stringify({ ok: true, workspace: options.workspace?.() ?? '' }))
+            } catch (error) {
+              response.writeHead(500).end(JSON.stringify({ ok: false, message: error instanceof Error ? error.message : String(error) }))
+            }
+            return
+          }
+          response.end(JSON.stringify({ workspace: options.workspace?.() ?? '' }))
+          return
+        }
+        if (path === '/wechat-gateway/api/browse') {
+          response.setHeader('content-type', 'application/json; charset=utf-8')
+          const url = new URL(request.url ?? '', 'http://localhost')
+          const queryPath = url.searchParams.get('path')?.trim() ?? ''
+          try {
+            // Windows: path 为空时列出可用盘符
+            if (queryPath === '' && process.platform === 'win32') {
+              const drives: string[] = []
+              for (const letter of 'CDEFGHIJKLMNOPQRSTUVWXYZ') {
+                const root = `${letter}:\\`
+                try {
+                  await stat(root)
+                  drives.push(root)
+                } catch { /* 盘符不存在 */ }
+              }
+              response.end(JSON.stringify({ path: '', parent: null, entries: drives }))
+              return
+            }
+            const targetPath = queryPath === '' ? process.cwd() : resolve(queryPath)
+            const metadata = await stat(targetPath)
+            if (!metadata.isDirectory()) {
+              response.writeHead(400).end(JSON.stringify({ error: '路径不是目录' }))
+              return
+            }
+            const items = await readdir(targetPath, { withFileTypes: true })
+            const entries = items
+              .filter(item => item.isDirectory() && !item.name.startsWith('.'))
+              .map(item => item.name)
+              .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+            // 计算上级目录
+            let parent: string | null = dirname(targetPath)
+            if (parent === targetPath) parent = null // 根目录
+            if (process.platform === 'win32' && /^[A-Za-z]:[\\/]?$/.test(targetPath)) {
+              parent = '' // Windows 盘符根目录的上级是盘符列表
+            }
+            response.end(JSON.stringify({ path: targetPath, parent, entries }))
+          } catch (error) {
+            response.writeHead(500).end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
           }
           return
         }
