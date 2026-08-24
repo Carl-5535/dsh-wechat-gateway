@@ -30,6 +30,8 @@ interface ClientContext {
 interface StateResponse {
   status: 'connected' | 'logged-out'
   account?: string
+  /** 凭据预计过期时刻（epoch ms），用于展示剩余有效期。 */
+  expiresAt?: number
   /** 原始二维码链接（微信落地页 URL，仅作展示/复制用）。 */
   qr?: string | null
   /** 服务端本地渲染的二维码 PNG data URL，<img> 直接可显。 */
@@ -65,6 +67,41 @@ function StatusDot({ connected }: { connected: boolean }): ReturnType<typeof cre
   })
 }
 
+/** 凭据剩余有效期展示文案；进入预警窗口（≤4 小时）时标橙提醒。 */
+function remainingLabel(expiresAt: number): { text: string; soon: boolean } | null {
+  const remaining = expiresAt - Date.now()
+  if (remaining <= 0) return null
+  const soon = remaining <= 4 * 3_600_000
+  if (remaining >= 3_600_000) {
+    const hours = remaining / 3_600_000
+    return { text: `剩 ${hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10} 小时`, soon }
+  }
+  return { text: `剩 ${Math.max(1, Math.ceil(remaining / 60_000))} 分钟`, soon }
+}
+
+/** 轻量开关（微信绿滑动式）。 */
+function Toggle({ on, onChange }: { on: boolean; onChange: (next: boolean) => void }): ReturnType<typeof createElement> {
+  return createElement('button', {
+    type: 'button',
+    role: 'switch',
+    'aria-checked': on,
+    onClick: () => { onChange(!on) },
+    style: {
+      appearance: 'none', flex: 'none', position: 'relative', width: 34, height: 20,
+      borderRadius: 10, border: 'none', cursor: 'pointer', padding: 0,
+      background: on ? WECHAT_GREEN : 'var(--dsw-alias-border-l2, #d5d5da)',
+      transition: 'background .15s',
+    } as CSSProperties,
+  },
+    createElement('span', {
+      'aria-hidden': true,
+      style: {
+        position: 'absolute', top: 2, left: on ? 16 : 2, width: 16, height: 16, borderRadius: '50%',
+        background: '#fff', boxShadow: '0 1px 3px rgba(0,0,0,.25)', transition: 'left .15s',
+      } as CSSProperties,
+    }))
+}
+
 function WeChatStatusButton(props: FooterActionFace) {
   const [open, setOpen] = useState(false)
   const [state, setState] = useState<StateResponse | null>(null)
@@ -76,6 +113,7 @@ function WeChatStatusButton(props: FooterActionFace) {
   const [browsePath, setBrowsePath] = useState('')
   const [browseEntries, setBrowseEntries] = useState<string[]>([])
   const [browseParent, setBrowseParent] = useState<string | null>(null)
+  const [expiryWarn, setExpiryWarn] = useState(true)
 
   const load = (start = false): void => {
     void fetch(`/wechat-gateway/api/state${start ? '?start=1' : ''}`).then(async response => setState(await response.json() as StateResponse)).catch(() => undefined)
@@ -85,6 +123,25 @@ function WeChatStatusButton(props: FooterActionFace) {
     void fetch('/wechat-gateway/api/workspace').then(async r => {
       const data = await r.json() as { workspace?: string }
       setWorkspace(data.workspace ?? '')
+    }).catch(() => undefined)
+  }
+
+  const loadExpiryWarn = (): void => {
+    void fetch('/wechat-gateway/api/expiry-warn').then(async r => {
+      const data = await r.json() as { enabled?: boolean }
+      if (typeof data.enabled === 'boolean') setExpiryWarn(data.enabled)
+    }).catch(() => undefined)
+  }
+
+  const saveExpiryWarn = (next: boolean): void => {
+    setExpiryWarn(next)
+    void fetch('/wechat-gateway/api/expiry-warn', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: next }),
+    }).then(async r => {
+      const data = await r.json() as { enabled?: boolean }
+      if (typeof data.enabled === 'boolean') setExpiryWarn(data.enabled)
     }).catch(() => undefined)
   }
 
@@ -135,12 +192,14 @@ function WeChatStatusButton(props: FooterActionFace) {
       if (rect !== undefined) setAnchor({ left: rect.right + 12, bottom: window.innerHeight - rect.bottom + 4 })
       load()
       loadWorkspace()
+      loadExpiryWarn()
     } else {
       setEditingWorkspace(false)
     }
   }
 
   const connected = state?.status === 'connected'
+  const expiry = state?.expiresAt === undefined ? null : remainingLabel(state.expiresAt)
   const qrImage = state?.qrImage ?? null
   const popover: CSSProperties = {
     position: 'fixed',
@@ -195,10 +254,18 @@ function WeChatStatusButton(props: FooterActionFace) {
         ? createElement('div', null,
             createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, marginBottom: 8 } },
               createElement(StatusDot, { connected: true }),
-              state?.account === undefined ? '已连接' : `已连接 · ${state.account}`),
+              state?.account === undefined ? '已连接' : `已连接 · ${state.account}`,
+              expiry === null ? null : createElement('span', {
+                style: { color: expiry.soon ? '#d97706' : 'var(--dsw-alias-label-tertiary, #9a9a9f)', whiteSpace: 'nowrap' },
+              }, ` · ${expiry.text}`)),
             createElement('div', { style: { fontSize: 12.5, color: 'var(--dsw-alias-label-tertiary, #9a9a9f)', lineHeight: 1.6 } },
               '在微信里直接给本账号发消息即可使用；发送 /help 查看命令。'),
-            createElement('div', { style: { marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--dsw-alias-border-l2, #e3e3e6)' } },
+            createElement('div', { style: { marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--dsw-alias-border-l2, #e3e3e6)', display: 'flex', alignItems: 'center', gap: 10 } },
+              createElement('div', { style: { flex: 1, minWidth: 0 } },
+                createElement('div', { style: { fontSize: 12.5 } }, '到期预警'),
+                createElement('div', { style: { fontSize: 11.5, color: 'var(--dsw-alias-label-tertiary, #9a9a9f)', marginTop: 2 } }, '凭据快过期时微信提醒我；收到消息自动续期')),
+              createElement(Toggle, { on: expiryWarn, onChange: saveExpiryWarn })),
+            createElement('div', { style: { marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--dsw-alias-border-l2, #e3e3e6)' } },
               createElement('div', { style: { fontSize: 11.5, color: 'var(--dsw-alias-label-tertiary, #9a9a9f)', marginBottom: 4 } }, '工作目录'),
               editingWorkspace
                 ? createElement('div', null,

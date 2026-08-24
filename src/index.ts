@@ -50,6 +50,8 @@ export interface Config {
   maxMediaBytes: number
   /** 回复正文提及的工作区内文件是否自动回发（显式 [[send-file]] 不受此开关影响）。 */
   autoSendMentionedFiles: boolean
+  /** 距凭据预计过期不足多少小时时推送到期预警（0 关闭）。 */
+  expiryWarnLeadHours: number
 }
 
 /**
@@ -77,6 +79,7 @@ export const Config: z<Config> = z.object({
   maxMessageChars: z.number().min(100).max(10_000).default(3_500),
   maxMediaBytes: z.number().min(1_024).max(512 * 1024 * 1024).default(100 * 1024 * 1024),
   autoSendMentionedFiles: z.boolean().default(autoSendFromEnv(process.env.WECHAT_AUTO_SEND_FILES) ?? true),
+  expiryWarnLeadHours: z.number().min(0).max(24).default(4),
 })
 
 /** 白名单判定：单聊需发送者在 allowedUsers；群聊还需群在 allowedGroups。 */
@@ -84,6 +87,52 @@ export function isAllowed(message: InboundMessage, config: Config): boolean {
   return message.group
     ? config.allowedGroups.includes(message.chatId) && config.allowedUsers.includes(message.userId)
     : config.allowedUsers.includes(message.userId)
+}
+
+/** 凭据有效期（腾讯策略：扫码 token 约 24 小时过期）。 */
+export const CREDENTIAL_TTL_MS = 24 * 60 * 60 * 1000
+
+/** 基于凭据 savedAt（扫码确认时刻）推算的到期视图。 */
+export interface ExpiryStatus {
+  /** 预计过期时刻（epoch ms）。 */
+  expiresAt: number
+  /** 距预计过期剩余毫秒（已过期为负）。 */
+  remainingMs: number
+  /** 是否落在预警窗口：未过期且剩余不超过 leadMs。 */
+  shouldWarn: boolean
+}
+
+/** 推算凭据到期视图；锚点缺失或无法解析时返回 undefined。 */
+export function expiryStatus(anchorAt: string | undefined, now: number, leadMs: number, ttlMs: number = CREDENTIAL_TTL_MS): ExpiryStatus | undefined {
+  if (anchorAt === undefined) return undefined
+  const issuedAt = Date.parse(anchorAt)
+  if (Number.isNaN(issuedAt)) return undefined
+  const expiresAt = issuedAt + ttlMs
+  const remainingMs = expiresAt - now
+  return { expiresAt, remainingMs, shouldWarn: remainingMs > 0 && remainingMs <= leadMs }
+}
+
+/** 到期推算锚点：以最近收信时间为准（收消息即续期 24 小时）；活动时间早于本凭据落盘时间（换号重登）时作废，缺失回退 savedAt。 */
+export function credentialAnchorAt(savedAt: string | undefined, activityAt: string | undefined): string | undefined {
+  if (savedAt === undefined) return activityAt
+  if (activityAt === undefined) return savedAt
+  return Date.parse(activityAt) >= Date.parse(savedAt) ? activityAt : savedAt
+}
+
+/** 剩余时长的人话描述：「约 3.5 小时」「约 40 分钟」。 */
+export function formatRemaining(remainingMs: number): string {
+  if (remainingMs >= 3_600_000) {
+    const hours = remainingMs / 3_600_000
+    return `约 ${hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10} 小时`
+  }
+  return `约 ${Math.max(1, Math.ceil(remainingMs / 60_000))} 分钟`
+}
+
+/** 凭据到期预警的推送文案。 */
+export function formatExpiryWarning(status: ExpiryStatus): string {
+  const clock = new Date(status.expiresAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+  return `⚠️ 微信通道凭据预计 ${formatRemaining(status.remainingMs)}后（${clock}）过期。`
+    + '过期后将无法收发消息，请在此之前到电脑上打开 DSH，从侧边栏底部「微信」入口重新扫码。'
 }
 
 /** 从事件流中收集 seq 之后最后一条助手文本。 */
@@ -271,6 +320,10 @@ class WechatGateway {
   readonly #seen: Set<string>
   /** 登录账号（扫码人）的 chatId，主动推送的目标。 */
   readonly #ownerChatId: string | undefined
+  /** 凭据落盘时间（扫码确认时刻），用于推算到期预警。 */
+  readonly #credentialSavedAt: string | undefined
+  /** 凭据到期预警的周期检查定时器。 */
+  #expiryTimer: ReturnType<typeof setInterval> | undefined
   /** 本地模型目录缓存（30 秒 TTL，避免连续 /model 反复询问 provider）。 */
   #catalog?: { at: number; models: ModelEntry[] }
   /** 通道健康度：连续轮询失败 3 次即判失效（凭据过期/断网），成功即恢复。 */
@@ -293,6 +346,28 @@ class WechatGateway {
     return this.#store.state.workspace || this.#config.workspace
   }
 
+  /** 凭据预计过期时刻（无法推算时为 undefined，供侧边栏展示剩余有效期）。 */
+  get credentialExpiresAt(): number | undefined {
+    return expiryStatus(this.#credentialAnchorAt, 0, 0)?.expiresAt
+  }
+
+  /** 到期推算锚点：最近收信时间（收消息即续期），否则凭据落盘时间。 */
+  get #credentialAnchorAt(): string | undefined {
+    return credentialAnchorAt(this.#credentialSavedAt, this.#store.state.credentialActivityAt)
+  }
+
+  /** 到期预警开关：侧边栏运行时覆盖优先，默认开启。 */
+  get expiryWarnEnabled(): boolean {
+    return this.#store.state.expiryWarnEnabled ?? true
+  }
+
+  /** 设置并持久化到期预警开关。 */
+  async setExpiryWarnEnabled(enabled: boolean): Promise<void> {
+    this.#store.state.expiryWarnEnabled = enabled
+    await this.#store.save()
+    this.#log(`凭据到期预警已${enabled ? '开启' : '关闭'}`)
+  }
+
   /** 设置并持久化运行时工作目录（传空串清除覆盖、回退到配置默认值）。 */
   async setWorkspace(path: string): Promise<void> {
     this.#store.state.workspace = path || undefined
@@ -300,12 +375,13 @@ class WechatGateway {
     this.#log(`工作目录已更新：${this.workspace}`)
   }
 
-  constructor(ctx: Context, config: Config, connection: { token: string; accountId?: string; apiBase: string; ownerChatId?: string }, store: GatewayStateStore) {
+  constructor(ctx: Context, config: Config, connection: { token: string; accountId?: string; apiBase: string; ownerChatId?: string; credentialSavedAt?: string }, store: GatewayStateStore) {
     this.#ctx = ctx
     this.#config = config
     this.#store = store
     this.#seen = new Set(store.state.seenMessageIds)
     this.#ownerChatId = connection.ownerChatId
+    this.#credentialSavedAt = connection.credentialSavedAt
     this.#client = new ILinkClient({
       ...connection,
       state: store.state.protocol,
@@ -366,6 +442,14 @@ class WechatGateway {
     void this.#startLoop().catch((error: unknown) => {
       if (!this.#abort.signal.aborted) this.#log(`网关停止: ${error instanceof Error ? error.message : String(error)}`)
     })
+    // 凭据到期预警：每 10 分钟检查一次，进入预警窗口时提醒一次（按 savedAt 去重）。
+    const expiryTick = (): void => {
+      void this.#checkExpiryWarning().catch((error: unknown) => {
+        if (!this.#abort.signal.aborted) this.#log(`凭据到期预警检查失败: ${error instanceof Error ? error.message : String(error)}`)
+      })
+    }
+    expiryTick()
+    this.#expiryTimer = setInterval(expiryTick, 10 * 60_000)
   }
 
   async #startLoop(): Promise<void> {
@@ -373,8 +457,24 @@ class WechatGateway {
     await this.#pollLoop()
   }
 
+  /** 到期预警：距预计过期不足 expiryWarnLeadHours 小时且开关开启时推送提醒；按锚点时间去重，收信续期或换凭据后进入新窗口会再提醒。 */
+  async #checkExpiryWarning(): Promise<void> {
+    const anchorAt = this.#credentialAnchorAt
+    if (anchorAt === undefined || this.#ownerChatId === undefined || !this.#channelHealthy) return
+    if (!this.expiryWarnEnabled) return
+    const leadMs = this.#config.expiryWarnLeadHours * 3_600_000
+    const status = expiryStatus(anchorAt, Date.now(), leadMs)
+    if (status === undefined || !status.shouldWarn) return
+    if (this.#store.state.credentialWarn?.anchorAt === anchorAt) return
+    await this.notifyOwner(formatExpiryWarning(status))
+    this.#store.state.credentialWarn = { anchorAt, warnedAt: new Date().toISOString() }
+    await this.#store.save()
+    this.#log(`已推送凭据到期预警（剩余 ${Math.round(status.remainingMs / 60_000)} 分钟）`)
+  }
+
   async dispose(): Promise<void> {
     this.#abort.abort()
+    if (this.#expiryTimer !== undefined) clearInterval(this.#expiryTimer)
     for (const dispose of this.#listeners.splice(0)) dispose()
     await Promise.all([...this.#chats.values()].map(async state => { await state.handle.dispose() }))
   }
@@ -659,6 +759,8 @@ class WechatGateway {
   async #receive(message: InboundMessage): Promise<void> {
     // 去重：iLink 在重连/游标回退时可能重推同一条消息。
     if (message.id !== '' && this.#seen.has(message.id)) return
+    // 任何新消息都视为通道活动：凭据 24 小时有效期从最近收信重新计起。
+    this.#store.state.credentialActivityAt = new Date().toISOString()
     if (message.id !== '') {
       this.#seen.add(message.id)
       // 有界去重表：超限淘汰最老条目。
@@ -846,6 +948,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       accountId: config.accountId ?? credential?.accountId,
       apiBase: config.apiBase || credential?.apiBase || 'https://ilinkai.weixin.qq.com',
       ownerChatId: credential?.userId,
+      credentialSavedAt: credential?.savedAt,
     }, new GatewayStateStore(config.statePath, await loadGatewayState(config.statePath)))
     gatewayAccount = credential?.accountId
     gateway.start()
@@ -884,11 +987,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     connected: () => gateway === undefined
       ? { state: 'disconnected' as const }
       : gateway.channelHealthy
-        ? { state: 'connected' as const, ...(gatewayAccount === undefined ? {} : { account: gatewayAccount }) }
+        ? {
+            state: 'connected' as const,
+            ...(gatewayAccount === undefined ? {} : { account: gatewayAccount }),
+            ...(gateway.credentialExpiresAt === undefined ? {} : { expiresAt: gateway.credentialExpiresAt }),
+          }
         : { state: 'stale' as const },
     workspace: () => gateway?.workspace ?? config.workspace,
     setWorkspace: async (path) => {
       if (gateway !== undefined) await gateway.setWorkspace(path)
+    },
+    expiryWarn: () => gateway?.expiryWarnEnabled ?? true,
+    setExpiryWarn: async (enabled) => {
+      if (gateway !== undefined) await gateway.setExpiryWarnEnabled(enabled)
     },
   })
   await startGateway()

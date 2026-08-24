@@ -7,6 +7,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
+import type { IncomingMessage } from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
 import { readdir, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
@@ -20,11 +21,15 @@ interface LoginRouteOptions {
   /** 登录成功后的回调（重启网关）。 */
   onCredential: () => Promise<void>
   /** 网关连接状态（三态）：connected 通道可用；stale 网关在跑但通道已失效（凭据过期/断网）；disconnected 未登录。 */
-  connected?: () => { state: 'connected' | 'stale' | 'disconnected'; account?: string }
+  connected?: () => { state: 'connected' | 'stale' | 'disconnected'; account?: string; expiresAt?: number }
   /** 当前生效的工作目录。 */
   workspace?: () => string
   /** 更新运行时工作目录。 */
   setWorkspace?: (path: string) => Promise<void>
+  /** 凭据到期预警开关的当前值。 */
+  expiryWarn?: () => boolean
+  /** 更新到期预警开关。 */
+  setExpiryWarn?: (enabled: boolean) => Promise<void>
 }
 
 interface StatusResult {
@@ -36,6 +41,21 @@ interface StatusResult {
 
 function isLoopback(address: string | undefined): boolean {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+}
+
+/** 读取并解析 JSON 请求体（空或非 JSON 时返回空对象）。 */
+function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => { chunks.push(chunk) })
+    request.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>)
+      } catch {
+        resolve({})
+      }
+    })
+  })
 }
 
 function pageHtml(qrImage: string, qrLink: string, statusUrl: string, verifyUrl: string): string {
@@ -181,7 +201,13 @@ export function mountLoginRoute(ctx: Context, options: LoginRouteOptions): void 
   /** /api/state：侧边栏状态组件的机读视图（纯缓存读，不触碰长轮询）。 */
   const apiState = async (start: boolean): Promise<Record<string, unknown>> => {
     const connection = options.connected?.()
-    if (connection?.state === 'connected') return { status: 'connected', ...(connection.account === undefined ? {} : { account: connection.account }) }
+    if (connection?.state === 'connected') {
+      return {
+        status: 'connected',
+        ...(connection.account === undefined ? {} : { account: connection.account }),
+        ...(connection.expiresAt === undefined ? {} : { expiresAt: connection.expiresAt }),
+      }
+    }
     // stale 且没有进行中的登录会话时提示重扫；二维码展示中（session 存在）不得覆盖，
     // 否则弹层的常规轮询会把刚取到的二维码冲掉。
     if (connection?.state === 'stale' && !start && session === undefined) {
@@ -222,13 +248,7 @@ export function mountLoginRoute(ctx: Context, options: LoginRouteOptions): void 
         if (path === '/wechat-gateway/api/workspace') {
           response.setHeader('content-type', 'application/json; charset=utf-8')
           if (request.method === 'POST') {
-            const body = await new Promise<string>((resolveBody) => {
-              const chunks: Buffer[] = []
-              request.on('data', (chunk: Buffer) => { chunks.push(chunk) })
-              request.on('end', () => { resolveBody(Buffer.concat(chunks).toString('utf8')) })
-            })
-            let parsed: { workspace?: string } = {}
-            try { parsed = JSON.parse(body) as { workspace?: string } } catch { /* empty body → reset */ }
+            const parsed = await readJsonBody(request)
             const value = typeof parsed.workspace === 'string' ? parsed.workspace.trim() : ''
             try {
               await options.setWorkspace?.(value)
@@ -239,6 +259,22 @@ export function mountLoginRoute(ctx: Context, options: LoginRouteOptions): void 
             return
           }
           response.end(JSON.stringify({ workspace: options.workspace?.() ?? '' }))
+          return
+        }
+        if (path === '/wechat-gateway/api/expiry-warn') {
+          response.setHeader('content-type', 'application/json; charset=utf-8')
+          if (request.method === 'POST') {
+            const parsed = await readJsonBody(request)
+            const enabled = typeof parsed.enabled === 'boolean' ? parsed.enabled : true
+            try {
+              await options.setExpiryWarn?.(enabled)
+              response.end(JSON.stringify({ ok: true, enabled: options.expiryWarn?.() ?? true }))
+            } catch (error) {
+              response.writeHead(500).end(JSON.stringify({ ok: false, message: error instanceof Error ? error.message : String(error) }))
+            }
+            return
+          }
+          response.end(JSON.stringify({ enabled: options.expiryWarn?.() ?? true }))
           return
         }
         if (path === '/wechat-gateway/api/browse') {

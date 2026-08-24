@@ -29,6 +29,12 @@ export interface GatewayState {
   outbox: Record<string, OutboxItem>
   /** 运行时覆盖的工作目录（空串或缺失时回退到 config.workspace）。 */
   workspace?: string
+  /** 最近一次收到微信消息的时间（ISO）：凭据 24 小时有效期从最近收信重新计起。 */
+  credentialActivityAt?: string
+  /** 到期预警开关的运行时覆盖（侧边栏开关；undefined 表示默认开启）。 */
+  expiryWarnEnabled?: boolean
+  /** 凭据到期预警记录：已对哪个锚点时间发过预警（换凭据/续期后自动重置）。 */
+  credentialWarn?: { anchorAt: string; warnedAt: string }
 }
 
 export function defaultStatePath(): string {
@@ -36,7 +42,17 @@ export function defaultStatePath(): string {
 }
 
 function emptyState(): GatewayState {
-  return { version: STATE_VERSION, chats: {}, seenMessageIds: [], protocol: { updatesBuffer: '', contextTokens: {} }, outbox: {}, workspace: undefined }
+  return {
+    version: STATE_VERSION,
+    chats: {},
+    seenMessageIds: [],
+    protocol: { updatesBuffer: '', contextTokens: {} },
+    outbox: {},
+    workspace: undefined,
+    credentialActivityAt: undefined,
+    expiryWarnEnabled: undefined,
+    credentialWarn: undefined,
+  }
 }
 
 function asRecord(value: unknown, field: string): Record<string, unknown> {
@@ -78,6 +94,12 @@ export async function loadGatewayState(path: string): Promise<GatewayState> {
     if (!Number.isInteger(nextFile) || nextFile < 0 || nextFile > files.length) throw new Error(`状态文件 outbox.${chatId}.nextFile 无效`)
     outbox[chatId] = { chunks: [...chunks], files: [...files], next, nextFile }
   }
+  let credentialWarn: GatewayState['credentialWarn']
+  if (value.credentialWarn !== undefined) {
+    const record = asRecord(value.credentialWarn, 'credentialWarn')
+    if (typeof record.anchorAt !== 'string' || typeof record.warnedAt !== 'string') throw new Error('状态文件 credentialWarn.anchorAt/warnedAt 必须是字符串')
+    credentialWarn = { anchorAt: record.anchorAt, warnedAt: record.warnedAt }
+  }
   return {
     version: STATE_VERSION,
     chats: stringRecord(value.chats, 'chats'),
@@ -85,6 +107,9 @@ export async function loadGatewayState(path: string): Promise<GatewayState> {
     protocol: { updatesBuffer: protocolSource.updatesBuffer, contextTokens },
     outbox,
     workspace: typeof value.workspace === 'string' ? value.workspace : undefined,
+    credentialActivityAt: typeof value.credentialActivityAt === 'string' ? value.credentialActivityAt : undefined,
+    expiryWarnEnabled: typeof value.expiryWarnEnabled === 'boolean' ? value.expiryWarnEnabled : undefined,
+    credentialWarn,
   }
 }
 

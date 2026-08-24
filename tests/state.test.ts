@@ -43,6 +43,29 @@ describe('loadGatewayState', () => {
     expect((await loadGatewayState(path)).seenMessageIds).toEqual(['second'])
   })
 
+  it('credentialActivityAt / expiryWarnEnabled / credentialWarn 可无损读回', async () => {
+    const path = await tempFile('state.json')
+    const store = new GatewayStateStore(path, await loadGatewayState(path))
+    store.state.credentialActivityAt = '2026-08-24T05:00:00.000Z'
+    store.state.expiryWarnEnabled = false
+    store.state.credentialWarn = { anchorAt: '2026-08-24T05:00:00.000Z', warnedAt: '2026-08-25T01:00:00.000Z' }
+    await store.save()
+    const restored = await loadGatewayState(path)
+    expect(restored.credentialActivityAt).toBe('2026-08-24T05:00:00.000Z')
+    expect(restored.expiryWarnEnabled).toBe(false)
+    expect(restored.credentialWarn).toEqual({ anchorAt: '2026-08-24T05:00:00.000Z', warnedAt: '2026-08-25T01:00:00.000Z' })
+  })
+
+  it('拒绝损坏的 credentialWarn', async () => {
+    const path = await tempFile('state.json')
+    await writeFile(path, JSON.stringify({
+      version: 1, chats: {}, seenMessageIds: [],
+      protocol: { updatesBuffer: '', contextTokens: {} },
+      credentialWarn: { anchorAt: 1 },
+    }), { mode: 0o600 })
+    await expect(loadGatewayState(path)).rejects.toThrow(/credentialWarn/)
+  })
+
   it('拒绝不支持的版本号', async () => {
     const path = await tempFile('state.json')
     await writeFile(path, JSON.stringify({ version: 99, chats: {}, seenMessageIds: [], protocol: { updatesBuffer: '', contextTokens: {} }, outbox: {} }), { mode: 0o600 })
