@@ -43,18 +43,38 @@ function isLoopback(address: string | undefined): boolean {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
 }
 
-/** 读取并解析 JSON 请求体（空或非 JSON 时返回空对象）。 */
+/** 请求体大小上限：登录页的 JSON 体都很小，超限按空对象处理。 */
+const MAX_BODY_BYTES = 64 * 1024
+
+/** 读取并解析 JSON 请求体（空、非 JSON、超限或连接中断时返回空对象）。 */
 function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = []
-    request.on('data', (chunk: Buffer) => { chunks.push(chunk) })
+    let bytes = 0
+    let finished = false
+    const finish = (value: Record<string, unknown>): void => {
+      if (finished) return
+      finished = true
+      resolve(value)
+    }
+    request.on('data', (chunk: Buffer) => {
+      if (finished) return
+      bytes += chunk.length
+      if (bytes > MAX_BODY_BYTES) {
+        finish({})
+        return
+      }
+      chunks.push(chunk)
+    })
     request.on('end', () => {
+      if (finished) return
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>)
+        finish(JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>)
       } catch {
-        resolve({})
+        finish({})
       }
     })
+    request.on('error', () => finish({}))
   })
 }
 

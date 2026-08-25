@@ -331,7 +331,7 @@ class WechatGateway {
   #channelHealthy = true
   /** 每聊天当前等待微信答复的审批（一次最多一条；后续请求排队投递）。 */
   readonly #pendingApprovals = new Map<string, PendingApproval>()
-  /** 每聊天的审批问题投递链：串行化多个并发审批的微信提问。 */
+  /** 每聊天的审批串行链：上一道问题得到答复（或转交/中止）后才投递下一道，保证答复永远路由到当前展示的问题。 */
   readonly #approvalAskChain = new Map<string, Promise<void>>()
   /** start() 注册的 ctx 监听器注销函数（重新扫码重启网关时清理，避免残留）。 */
   readonly #listeners: Array<() => void> = []
@@ -493,9 +493,13 @@ class WechatGateway {
       return
     }
     const delivery = extractFileDirectives(output.text)
-    const chunks = delivery.text === '' ? [] : splitText(delivery.text, this.#config.maxMessageChars)
+    // 上一轮若有未送完的残余（如发送通道长时间失败），排在新内容前面，维持「绝不丢失」。
+    const previous = this.#store.state.outbox[chatId]
+    const carriedChunks = previous === undefined ? [] : previous.chunks.slice(previous.next)
+    const carriedFiles = previous === undefined ? [] : previous.files.slice(previous.nextFile)
+    const chunks = [...carriedChunks, ...(delivery.text === '' ? [] : splitText(delivery.text, this.#config.maxMessageChars))]
     const mentioned = this.#config.autoSendMentionedFiles ? await this.#collectMentionedFiles(delivery.text, delivery.files) : []
-    this.#store.state.outbox[chatId] = { chunks, files: [...delivery.files, ...mentioned], next: 0, nextFile: 0 }
+    this.#store.state.outbox[chatId] = { chunks, files: [...carriedFiles, ...delivery.files, ...mentioned], next: 0, nextFile: 0 }
     await this.#store.save()
     await this.#drainOutbox(chatId)
     // 全部送达才推进 sentThroughSeq：中途崩溃重启后会重发该轮回复，
@@ -653,45 +657,57 @@ class WechatGateway {
   }
 
   /**
-   * 审批 answerer 主体（串行，微信优先）。问题只发微信：回复认可/拒绝词
-   * 直接认领；回复「网页」、通道中途失效或任务中止时调用 next() 转交后续
-   * 应答者（Web UI 审批面板）——面板的待审批表项只能由浏览器响应或中止
-   * 信号清除，因此绝不能在它已显示后又从他处结算，否则面板会僵死。
+   * 审批 answerer 主体（串行，微信优先）。整个审批周期（提问 → 等待答复 →
+   * 清理）在 #approvalAskChain 上串行：上一道问题被答复（或转交/中止）后才
+   * 会投递下一道，因此每个聊天任意时刻至多一条待答复审批，微信答复永远
+   * 路由到当前展示的那道问题，不会出现并发审批互相覆盖、答错对象。
+   * 回复认可/拒绝词直接认领；回复「网页」、通道中途失效或任务中止时调用
+   * next() 转交后续应答者（Web UI 审批面板）——面板的待审批表项只能由
+   * 浏览器响应或中止信号清除，因此绝不能在它已显示后又从他处结算，否则
+   * 面板会僵死。
    */
   async #approvalViaWechat(chatId: string, req: ApprovalRequest, next: () => Promise<ApprovalOutcome>): Promise<ApprovalOutcome> {
     const pending: PendingApproval = { toolName: req.toolName, reason: req.reason, settle: () => undefined }
     const answer = new Promise<ApprovalReplyAction>(resolve => { pending.settle = resolve })
     const questionAbort = new AbortController()
     const chain = this.#approvalAskChain.get(chatId) ?? Promise.resolve()
-    const delivered = chain
+    const handled = chain
       .then(async () => {
         this.#pendingApprovals.set(chatId, pending)
+        // 看门狗与提问投递并行启动：投递卡死（通道失效）时看门狗仍能转交网页端。
+        const decided = new Promise<ApprovalReplyAction | undefined>(resolve => {
+          let timer: ReturnType<typeof setInterval> | undefined
+          let done = false
+          const finish = (value: ApprovalReplyAction | undefined): void => {
+            if (done) return
+            done = true
+            if (timer !== undefined) clearInterval(timer)
+            resolve(value)
+          }
+          // 看门狗：等待期间通道判死（凭据过期/断网）即转交，避免问题永远无人应答。
+          timer = setInterval(() => { if (!this.#channelHealthy) finish(undefined) }, 30_000)
+          ;(timer as { unref?: () => void }).unref?.()
+          answer.then(action => finish(action))
+          // 任务中止撤销请求：转交后续应答者（对已中止的请求它们同步返回 cancelled）。
+          req.signal?.addEventListener('abort', () => finish(undefined), { once: true })
+        })
+        // 一旦有结论（答复/转交/中止）就停止提问投递，避免卡住整条串行链。
+        void decided.then(() => questionAbort.abort())
         const lines = ['🔐 Agent 请求审批', `工具：${req.toolName}`]
         if (req.reason !== undefined && req.reason !== '') lines.push(`原因：${req.reason}`)
         lines.push('回复「同意」或「拒绝」；也可以回复「网页」转到网页端审批面板处理。')
         const signal = req.signal === undefined ? questionAbort.signal : AbortSignal.any([req.signal, questionAbort.signal])
-        await this.#sendWithRetry(chatId, lines.join('\n'), signal)
+        await this.#sendWithRetry(chatId, lines.join('\n'), signal).catch(() => undefined) // 提问投递失败不阻断：看门狗发现通道失效后会转交网页端
+        return await decided
       })
-      .catch(() => undefined) // 提问投递失败不阻断：看门狗发现通道失效后会转交网页端
-    this.#approvalAskChain.set(chatId, delivered)
-    const action = await new Promise<ApprovalReplyAction | undefined>(resolve => {
-      let timer: ReturnType<typeof setInterval> | undefined
-      let done = false
-      const finish = (value: ApprovalReplyAction | undefined): void => {
-        if (done) return
-        done = true
-        if (timer !== undefined) clearInterval(timer)
-        resolve(value)
-      }
-      // 看门狗：等待期间通道判死（凭据过期/断网）即转交，避免问题永远无人应答。
-      timer = setInterval(() => { if (!this.#channelHealthy) finish(undefined) }, 30_000)
-      ;(timer as { unref?: () => void }).unref?.()
-      answer.then(action => finish(action))
-      // 任务中止撤销请求：转交后续应答者（对已中止的请求它们同步返回 cancelled）。
-      req.signal?.addEventListener('abort', () => finish(undefined), { once: true })
-    })
-    questionAbort.abort()
-    if (this.#pendingApprovals.get(chatId) === pending) this.#pendingApprovals.delete(chatId)
+    this.#approvalAskChain.set(chatId, handled.then(() => undefined, () => undefined))
+    let action: ApprovalReplyAction | undefined
+    try {
+      action = await handled
+    } finally {
+      questionAbort.abort()
+      if (this.#pendingApprovals.get(chatId) === pending) this.#pendingApprovals.delete(chatId)
+    }
     if (action === undefined) return await next()
     if (action === 'web') return await next()
     return action
@@ -868,6 +884,8 @@ class WechatGateway {
     }
     const persistedSession = this.#store.state.chats[chatId]
     let handle: AgentHandle
+    // 仅新建会话时写入默认权限预设；resume/附着不覆盖用户已用 /permission 或 Web UI 切换的模式。
+    let created = false
     if (persistedSession !== undefined) {
       const active = this.#ctx.agents.get(sessionId(persistedSession))
       if (active !== undefined) {
@@ -890,15 +908,17 @@ class WechatGateway {
           this.#log(`无法恢复会话 ${persistedSession}，改为新建: ${error instanceof Error ? error.message : String(error)}`)
           delete this.#store.state.chats[chatId]
           handle = await this.#createAgent(selection, setup)
+          created = true
         }
       }
     } else {
       handle = await this.#createAgent(selection, setup)
+      created = true
     }
     const state = { handle, selectionRef: selected, sentThroughSeq: handle.agent.session.seq, delivery: Promise.resolve(), typing: Promise.resolve() }
     const permissionPresets = this.#ctx.get('permissionPresets') as PermissionPresetService | undefined
     if (permissionPresets === undefined) throw new Error('wechat-gateway: permissionPresets 服务不可用')
-    permissionPresets.set(handle.agent.session, 'workspace-write')
+    if (created) permissionPresets.set(handle.agent.session, 'workspace-write')
     const sessionTitle = this.#ctx.get('sessionTitle') as SessionTitleService | undefined
     if (sessionTitle === undefined) throw new Error('wechat-gateway: sessionTitle 服务不可用')
     sessionTitle.rename(handle.agent.session, '微信')
