@@ -79,6 +79,11 @@ function remainingLabel(expiresAt: number): { text: string; soon: boolean } | nu
   return { text: `剩 ${Math.max(1, Math.ceil(remaining / 60_000))} 分钟`, soon }
 }
 
+/** 弹层横向锚点钳制：优先锚点位置，右侧至少留 12px、左侧至少 8px（弹层宽 300）。 */
+export function clampPopoverLeft(anchorLeft: number | undefined, viewportWidth: number): number {
+  return Math.max(8, Math.min(anchorLeft ?? 280, viewportWidth - 312))
+}
+
 /** 轻量开关（微信绿滑动式）。 */
 function Toggle({ on, onChange }: { on: boolean; onChange: (next: boolean) => void }): ReturnType<typeof createElement> {
   return createElement('button', {
@@ -201,11 +206,15 @@ function WeChatStatusButton(props: FooterActionFace) {
   const connected = state?.status === 'connected'
   const expiry = state?.expiresAt === undefined ? null : remainingLabel(state.expiresAt)
   const qrImage = state?.qrImage ?? null
+  const anchorBottom = anchor?.bottom ?? 48
   const popover: CSSProperties = {
     position: 'fixed',
-    left: `${anchor?.left ?? 280}px`,
-    bottom: `${anchor?.bottom ?? 48}px`,
+    left: `${clampPopoverLeft(anchor?.left, window.innerWidth)}px`,
+    bottom: `${anchorBottom}px`,
     width: 300,
+    // 纵向钳制：窗口过矮时弹层内部滚动，而不是溢出屏幕顶缘。
+    maxHeight: `calc(100vh - ${anchorBottom + 8}px)`,
+    overflowY: 'auto',
     zIndex: 1000,
     background: 'var(--dsw-alias-bg-layer-3, #fff)',
     color: 'var(--dsw-alias-label-primary, inherit)',

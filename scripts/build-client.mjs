@@ -14,6 +14,7 @@ if (!source.includes(reactImport)) throw new Error('client 入口的 React impor
 source = source.replace(reactImport, 'const { createElement, useEffect, useRef, useState } = require("react");')
 source = source.replace('export const inject =', 'const inject =')
 source = source.replace('export function apply(', 'function apply(')
+source = source.replace('export function clampPopoverLeft(', 'function clampPopoverLeft(')
 source = source.replace(/\n?\/\/# sourceMappingURL=client\.js\.map\s*$/, '')
 if (/\b(?:import|export)\s/.test(source)) throw new Error('client 产物仍含 ESM 语法')
 
