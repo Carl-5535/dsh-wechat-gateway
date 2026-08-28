@@ -189,12 +189,31 @@ function WeChatStatusButton(props: FooterActionFace) {
     if (state?.refresh === true) load(true)
   }, [state?.refresh])
 
+  // 弹层是 fixed 定位，锚点只在展开瞬间取一次的话，侧边栏收缩/窗口缩放移动按钮后弹层会留在原地。
+  // 打开期间持续重测：按钮宽度随布局变化，ResizeObserver 正好覆盖侧边栏收展；窗口缩放走 resize。
+  const measureAnchor = (): void => {
+    const rect = buttonRef.current?.getBoundingClientRect()
+    if (rect !== undefined) setAnchor({ left: rect.right + 12, bottom: window.innerHeight - rect.bottom + 4 })
+  }
+
+  useEffect(() => {
+    if (!open) return
+    measureAnchor()
+    const button = buttonRef.current
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measureAnchor)
+    if (button !== null && observer !== null) observer.observe(button)
+    window.addEventListener('resize', measureAnchor)
+    return () => {
+      observer?.disconnect()
+      window.removeEventListener('resize', measureAnchor)
+    }
+  }, [open])
+
   const toggle = (): void => {
     const next = !open
     setOpen(next)
     if (next) {
-      const rect = buttonRef.current?.getBoundingClientRect()
-      if (rect !== undefined) setAnchor({ left: rect.right + 12, bottom: window.innerHeight - rect.bottom + 4 })
+      measureAnchor()
       load()
       loadWorkspace()
       loadExpiryWarn()
