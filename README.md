@@ -141,3 +141,13 @@ npm run build       # 产出 lib/（含客户端 bundle）
 ## 致谢与许可
 
 [MIT License](https://github.com/Carl-5535/dsh-wechat-gateway/blob/main/LICENSE) 开源。独立实现，部分设计衍生自社区 MIT 实现：iLink 协议层与投递队列参考 [dsh-weixin](https://github.com/xiaoshihou514/dsh-weixin)，协议细节与 [dsh-wechat-bridge](https://github.com/gtaifu/dsh-wechat-bridge) 及官方 SDK 交叉验证。完整第三方声明见 [LICENSE](https://github.com/Carl-5535/dsh-wechat-gateway/blob/main/LICENSE#third-party-notices)。
+
+## wechat 服务（供其它插件调用）
+
+网关加载后向 ctx 暴露 `wechat` 服务（软探测 `ctx.get('wechat')` 即可使用，无需 inject 声明）：
+
+| 成员 | 说明 |
+| --- | --- |
+| `notify(text, image?)` | 把文本（可附带一张图片 `{ name, data: Uint8Array }`）主动推送到登录账号的微信，返回送达人数；未登录时抛错 |
+
+图片走 `ILinkClient.sendMedia` 的 CDN 加密上传，按文件名分类为原生图片/文件消息。未登录或通道失效时 `notify` 抛错，调用方应自行降级。

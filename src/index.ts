@@ -33,6 +33,9 @@ export const name = 'wechat-gateway'
 /** 网关需要注入的 DSH 服务。 */
 export const inject = ['agentDefaultModel', 'agentPresets', 'agents', 'llm', 'permissionPresets', 'sessions', 'sessionTitle', 'tools']
 
+/** 本插件向 ctx 提供的服务（wechat-gateway 重扫/重启后由 apply 重新赋值）。 */
+export const provide = ['wechat']
+
 export interface Config {
   tokenEnv: string
   credentialPath: string
@@ -394,12 +397,19 @@ class WechatGateway {
     })
   }
 
-  /** 供 wechat_notify 工具调用：把文本主动推送到登录账号的微信。 */
-  async notifyOwner(text: string, signal?: AbortSignal): Promise<void> {
+  /**
+   * 供 wechat_notify 工具与 wechat 服务调用：把文本（可附带一张图片）主动推送到登录账号的微信。
+   * 图片走 sendMedia 的 CDN 加密上传，按文件名分类为原生图片/文件消息。
+   */
+  async notifyOwner(text: string, options?: { signal?: AbortSignal; image?: { name: string; data: Uint8Array } }): Promise<void> {
     if (this.#ownerChatId === undefined) throw new Error('未记录登录账号的微信 id（可能使用环境变量 token 启动），无法主动推送')
     if (!this.#channelHealthy) throw new Error('微信连接已失效（凭据过期或网络中断）：请重新扫码后再试')
+    const signal = options?.signal
     for (const chunk of splitText(text, this.#config.maxMessageChars)) {
       await this.#sendWithRetry(this.#ownerChatId, chunk, signal)
+    }
+    if (options?.image !== undefined) {
+      await this.#sendMediaWithRetry(this.#ownerChatId, options.image.name, options.image.data)
     }
   }
 
@@ -996,7 +1006,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     async execute(args: { text: string }, exec: ToolRunContext): Promise<JsonValue> {
       if (args.text.trim() === '') throw new Error('text 必须是非空字符串')
       if (gateway === undefined) throw new Error('微信未登录：请在 DSH 侧边栏底部的「微信」入口扫码连接后再试')
-      await gateway.notifyOwner(args.text, exec.signal)
+      await gateway.notifyOwner(args.text, { signal: exec.signal })
       return { ok: true, channel: 'wechat' }
     },
   }))
@@ -1024,6 +1034,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   })
   await startGateway()
   if (gateway === undefined) process.stderr.write('wechat-gateway: 尚未登录微信。在 Harness Web UI 打开 /wechat-gateway/login 扫码，或运行 npx dsh-wechat-gateway login。\n')
+  // 对其它插件暴露 wechat 服务：notify(text, image?) 主动推送文本/图片到登录账号的微信。
+  // 闭包读 gateway 变量，扫码重连后自动指向新实例；未登录时调用抛错（调用方自行降级）。
+  const wechatService = {
+    notify: async (text: string, image?: { name: string; data: Uint8Array }): Promise<number> => {
+      if (gateway === undefined) throw new Error('微信未登录：请在 DSH 侧边栏底部的「微信」入口扫码连接后再试')
+      await gateway.notifyOwner(text, { image })
+      return 1
+    },
+  }
+  ;(ctx as Context & { provide?: (name: string) => void }).provide?.('wechat')
+  ;(ctx as Context & { wechat?: unknown }).wechat = wechatService
+  ctx.effect(() => () => { (ctx as Context & { wechat?: unknown }).wechat = undefined })
   ctx.effect(() => async () => { await gateway?.dispose() })
 }
 
