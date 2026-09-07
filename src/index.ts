@@ -135,7 +135,7 @@ export function formatRemaining(remainingMs: number): string {
 export function formatExpiryWarning(status: ExpiryStatus): string {
   const clock = new Date(status.expiresAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
   return `⚠️ 微信通道凭据预计 ${formatRemaining(status.remainingMs)}后（${clock}）过期。`
-    + '过期后将无法收发消息，请在此之前到电脑上打开 DSH，从侧边栏底部「微信」入口重新扫码。'
+    + '过期不影响登录和收消息，只是期间无法主动推送通知；届时在微信里发一条消息即可保活续期，无需重新扫码。'
 }
 
 /** 从事件流中收集 seq 之后最后一条助手文本。 */
@@ -403,7 +403,7 @@ class WechatGateway {
    */
   async notifyOwner(text: string, options?: { signal?: AbortSignal; image?: { name: string; data: Uint8Array } }): Promise<void> {
     if (this.#ownerChatId === undefined) throw new Error('未记录登录账号的微信 id（可能使用环境变量 token 启动），无法主动推送')
-    if (!this.#channelHealthy) throw new Error('微信连接已失效（凭据过期或网络中断）：请重新扫码后再试')
+    if (!this.#channelHealthy) throw new Error('微信通道当前无法主动推送（凭据过期或网络中断）：在微信里发一条消息即可保活恢复，无需重新扫码')
     const signal = options?.signal
     for (const chunk of splitText(text, this.#config.maxMessageChars)) {
       await this.#sendWithRetry(this.#ownerChatId, chunk, signal)

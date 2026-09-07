@@ -66,13 +66,15 @@ describe('formatRemaining', () => {
 })
 
 describe('formatExpiryWarning', () => {
-  it('包含剩余时长与重扫指引', () => {
+  it('包含剩余时长与保活指引，不误导为需要重扫', () => {
     const savedAt = '2026-08-24T00:00:00.000Z'
     const status = expiryStatus(savedAt, Date.parse('2026-08-24T20:00:00.000Z'), 4 * HOUR)
     expect(status).toBeDefined()
     const text = formatExpiryWarning(status!)
     expect(text).toContain('约 4 小时')
     expect(text).toContain('过期')
-    expect(text).toContain('重新扫码')
+    expect(text).toContain('不影响登录')
+    expect(text).toContain('发一条消息')
+    expect(text).not.toContain('无法收发')
   })
 })
