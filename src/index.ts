@@ -14,7 +14,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent, AgentHandle, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
-import type { SessionEvent, JsonValue } from '@deepseek-ai/dsh-session'
+import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-llm'
@@ -497,7 +498,7 @@ class WechatGateway {
   async #deliver(chatId: string, state: ChatState): Promise<void> {
     await state.typing
     void this.#client.sendTyping(chatId, false, this.#abort.signal).catch(() => undefined)
-    const output = assistantText(state.handle.agent.session.events, state.sentThroughSeq)
+    const output = assistantText(state.handle.agent.session.snapshotEvents(), state.sentThroughSeq)
     if (output.text === '') {
       state.sentThroughSeq = output.seq
       return
@@ -733,7 +734,7 @@ class WechatGateway {
     const state = this.#chats.get(chatId)
     const names = [...presets.names]
     if (rest === '') {
-      const currentName = state === undefined ? presets.defaultPreset : presets.current(state.handle.agent.session.events)
+      const currentName = state === undefined ? presets.defaultPreset : presets.current(state.handle.agent.session.snapshotEvents())
       const lines = ['权限模式（✅ 为当前，切换仅对本聊天生效）：']
       names.forEach((name, index) => {
         const spec = presets.resolve(name)
