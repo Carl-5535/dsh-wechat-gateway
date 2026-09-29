@@ -18,7 +18,7 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import type {} from '@deepseek-ai/dsh-llm'
+import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { ApprovalRequest, ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { ILinkClient, type InboundMessage } from './ilink.js'
@@ -844,7 +844,7 @@ class WechatGateway {
       await this.#sendWithRetry(message.chatId, `⏳ 有一条审批等待答复（工具：${approval.toolName}）：回复「同意」或「拒绝」，回复「网页」转网页端，或发 /stop 中止任务。`)
     }
     const state = await this.#chat(message.chatId)
-    const blocks: Parameters<typeof contentUserMessage>[0] = []
+    const blocks: ContentBlock[] = []
     if (message.text !== '') blocks.push({ type: 'text', text: message.text })
     const paths: string[] = []
     const mediaRoot = this.#config.mediaDir || `${this.workspace}/.wechat-gateway/inbox`
