@@ -43,6 +43,21 @@ describe('loadGatewayState', () => {
     expect((await loadGatewayState(path)).seenMessageIds).toEqual(['second'])
   })
 
+  it('save 失败不毒化后续 save：同一实例写盘失败后恢复', async () => {
+    const { mkdir, rm } = await import('node:fs/promises')
+    const path = await tempFile('state.json')
+    const store = new GatewayStateStore(path, await loadGatewayState(path))
+    // 把状态路径指到一个目录：rename 落盘必然失败（EISDIR/EPERM），令第一次 save 抛错。
+    await mkdir(path)
+    store.state.seenMessageIds = ['before']
+    await expect(store.save()).rejects.toThrow()
+    // 移除故障源后，第二次 save 必须真正执行写入并成功，而非复用陈旧错误拒绝。
+    await rm(path, { recursive: true })
+    store.state.seenMessageIds = ['after']
+    await store.save()
+    expect((await loadGatewayState(path)).seenMessageIds).toEqual(['after'])
+  })
+
   it('credentialActivityAt / expiryWarnEnabled / credentialWarn 可无损读回', async () => {
     const path = await tempFile('state.json')
     const store = new GatewayStateStore(path, await loadGatewayState(path))

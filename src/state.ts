@@ -169,7 +169,8 @@ export class GatewayStateStore {
   }
 
   save(): Promise<void> {
-    this.#pending = this.#pending.then(async () => {
+    // 先吞掉前一次的失败再排队写盘：写盘错误只属于当次调用，不毒化后续 save。
+    this.#pending = this.#pending.catch(() => undefined).then(async () => {
       await writePrivateJson(this.path, structuredClone(this.state))
     })
     return this.#pending

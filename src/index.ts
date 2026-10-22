@@ -452,7 +452,7 @@ class WechatGateway {
       const target = resolveDeliveryTarget({ mappedChatId: this.#agentChats.get(agent), chats: this.#store.state.chats, sessionKey: session.id })
       if (target === undefined) return
       if (target === 'skipped') {
-        this.#recordDeliveryLog(session.id, { at: new Date().toISOString(), outcome: 'skipped', detail: '网关会话的持久映射缺失，无法路由投递', chunks: 0 })
+        this.#recordDeliveryLog(session.id, this.#deliveryEntry('skipped', 0, '网关会话的持久映射缺失，无法路由投递'))
         return
       }
       const chatId = target.chatId
@@ -470,7 +470,7 @@ class WechatGateway {
         if (this.#abort.signal.aborted) return
         const detail = error instanceof Error ? error.message : String(error)
         this.#log(`投递失败: ${detail}`)
-        this.#recordDeliveryLog(chatId, { at: new Date().toISOString(), outcome: 'failed', detail: detail.slice(0, 200), chunks: 0 })
+        this.#recordDeliveryLog(chatId, this.#deliveryEntry('failed', 0, detail.slice(0, 200)))
       })
     }))
     // 审批应答（waterfall，prepend 保证 OUTER）：微信绑定的 Agent 发起审批时
@@ -533,6 +533,11 @@ class WechatGateway {
     })
   }
 
+  /** 统一构造投递记录（at 取当下，detail 缺省时不写字段）。 */
+  #deliveryEntry(outcome: DeliveryLogEntry['outcome'], chunks: number, detail?: string): DeliveryLogEntry {
+    return { at: new Date().toISOString(), outcome, chunks, ...(detail === undefined ? {} : { detail }) }
+  }
+
   /** 回合结束 → 提取回复 → 写入持久化发件箱 → 尽力送完。 */
   async #deliver(chatId: string, state: ChatState): Promise<void> {
     await state.typing
@@ -557,11 +562,11 @@ class WechatGateway {
     // 代价是极端情况下的重复消息，换来绝不丢失。
     if (this.#store.state.outbox[chatId] === undefined) {
       state.sentThroughSeq = output.seq
-      this.#recordDeliveryLog(chatId, { at: new Date().toISOString(), outcome: 'delivered', chunks: chunks.length })
+      this.#recordDeliveryLog(chatId, this.#deliveryEntry('delivered', chunks.length))
       return
     }
-    // 发送未完成（中止/通道断）：内容保留在 outbox，重启后由 #drainStoredOutbox 续发。
-    this.#recordDeliveryLog(chatId, { at: new Date().toISOString(), outcome: 'deferred', detail: '发送未完成，内容保留在发件箱待重试', chunks: chunks.length })
+    // 发送未完成（通道断）：内容保留在 outbox，重启后由 #drainStoredOutbox 续发。
+    this.#recordDeliveryLog(chatId, this.#deliveryEntry('deferred', chunks.length, '发送未完成，内容保留在发件箱待重试'))
   }
 
   async #drainStoredOutbox(): Promise<void> {
