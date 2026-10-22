@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { GatewayStateStore, loadGatewayState } from '../src/state.js'
+import { GatewayStateStore, loadGatewayState, pushDeliveryEntry, type DeliveryLogEntry } from '../src/state.js'
 
 async function tempFile(name: string): Promise<string> {
   return join(await mkdtemp(join(tmpdir(), 'wg-')), name)
@@ -56,6 +56,36 @@ describe('loadGatewayState', () => {
     expect(restored.credentialWarn).toEqual({ anchorAt: '2026-08-24T05:00:00.000Z', warnedAt: '2026-08-25T01:00:00.000Z' })
   })
 
+  it('旧版状态（无 deliveryLog 字段）加载后 deliveryLog 为空对象', async () => {
+    const path = await tempFile('state.json')
+    await writeFile(path, JSON.stringify({
+      version: 1, chats: {}, seenMessageIds: [],
+      protocol: { updatesBuffer: '', contextTokens: {} },
+      outbox: {},
+    }), { mode: 0o600 })
+    const state = await loadGatewayState(path)
+    expect(state.deliveryLog).toEqual({})
+  })
+
+  it('deliveryLog 可无损读回', async () => {
+    const path = await tempFile('state.json')
+    const store = new GatewayStateStore(path, await loadGatewayState(path))
+    store.state.deliveryLog['chat-1'] = [{ at: '2026-10-22T00:00:00.000Z', outcome: 'delivered', chunks: 3 }]
+    await store.save()
+    const restored = await loadGatewayState(path)
+    expect(restored.deliveryLog['chat-1']).toEqual([{ at: '2026-10-22T00:00:00.000Z', outcome: 'delivered', chunks: 3 }])
+  })
+
+  it('拒绝损坏的 deliveryLog', async () => {
+    const path = await tempFile('state.json')
+    await writeFile(path, JSON.stringify({
+      version: 1, chats: {}, seenMessageIds: [],
+      protocol: { updatesBuffer: '', contextTokens: {} },
+      deliveryLog: { c: [{ at: 'x', outcome: 'boom', chunks: 0 }] },
+    }), { mode: 0o600 })
+    await expect(loadGatewayState(path)).rejects.toThrow(/deliveryLog/)
+  })
+
   it('拒绝损坏的 credentialWarn', async () => {
     const path = await tempFile('state.json')
     await writeFile(path, JSON.stringify({
@@ -97,5 +127,37 @@ describe('store.ts 私有文件权限', () => {
     const text = await readFile(path, 'utf8')
     expect(text.endsWith('\n')).toBe(true)
     expect(JSON.parse(text)).toEqual({ token: 't' })
+  })
+})
+
+describe('pushDeliveryEntry', () => {
+  it('新的条目插入头部', () => {
+    const first = pushDeliveryEntry({}, 'c', { at: 't1', outcome: 'delivered', chunks: 1 })
+    const second = pushDeliveryEntry(first, 'c', { at: 't2', outcome: 'deferred', chunks: 2 })
+    expect(second['c']!.map(entry => entry.at)).toEqual(['t2', 't1'])
+  })
+
+  it('超过 20 条上限时淘汰最老条目', () => {
+    let log: Record<string, DeliveryLogEntry[]> = {}
+    for (let i = 0; i < 25; i += 1) {
+      log = pushDeliveryEntry(log, 'c', { at: `t${i}`, outcome: 'delivered', chunks: 1 })
+    }
+    const entries = log['c']!
+    expect(entries).toHaveLength(20)
+    expect(entries[0]!.at).toBe('t24')
+    expect(entries.at(-1)!.at).toBe('t5')
+  })
+
+  it('不改动传入的旧记录（不可变）', () => {
+    const before: Record<string, DeliveryLogEntry[]> = { c: [{ at: 't1', outcome: 'delivered', chunks: 1 }] }
+    pushDeliveryEntry(before, 'c', { at: 't2', outcome: 'failed', chunks: 0 })
+    expect(before['c']).toHaveLength(1)
+  })
+
+  it('不同聊天互不影响', () => {
+    let log = pushDeliveryEntry({}, 'a', { at: 't1', outcome: 'delivered', chunks: 1 })
+    log = pushDeliveryEntry(log, 'b', { at: 't2', outcome: 'delivered', chunks: 1 })
+    expect(log['a']).toHaveLength(1)
+    expect(log['b']).toHaveLength(1)
   })
 })
