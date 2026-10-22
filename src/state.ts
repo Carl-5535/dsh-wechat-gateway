@@ -107,7 +107,7 @@ function deliveryLogFrom(value: unknown): Record<string, DeliveryLogEntry[]> {
       if (typeof entry.chunks !== 'number' || !Number.isInteger(entry.chunks) || entry.chunks < 0) throw new Error(`状态文件 deliveryLog.${key}[${index}].chunks 无效`)
       if (entry.detail !== undefined && typeof entry.detail !== 'string') throw new Error(`状态文件 deliveryLog.${key}[${index}].detail 必须是字符串`)
       return { at: entry.at, outcome: entry.outcome as DeliveryLogEntry['outcome'], chunks: entry.chunks, ...(entry.detail === undefined ? {} : { detail: entry.detail }) }
-    })
+    }).slice(0, DELIVERY_LOG_LIMIT)
   }
   return log
 }

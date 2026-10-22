@@ -93,6 +93,23 @@ export function isAllowed(message: InboundMessage, config: Config): boolean {
     : config.allowedUsers.includes(message.userId)
 }
 
+/** 投递路由结果：命中（recovered 标记是否经由持久映射反查恢复）、skipped（网关会话失联）。 */
+export type DeliveryTarget = { chatId: string; recovered: boolean } | 'skipped'
+
+/**
+ * turn/end 的投递路由判定：内存映射为快路径；缺失时反查持久映射 state.chats
+ * （chatId → sessionId）；网关创建的会话 id 均带 wechat- 前缀，两处都查不到却
+ * 仍带前缀说明持久映射已失去（记 skipped）；无前缀的是普通非微信会话（undefined，
+ * 正常路径，不记日志）。
+ */
+export function resolveDeliveryTarget(input: { mappedChatId: string | undefined; chats: Record<string, string>; sessionKey: string }): DeliveryTarget | undefined {
+  if (input.mappedChatId !== undefined) return { chatId: input.mappedChatId, recovered: false }
+  for (const [chatId, id] of Object.entries(input.chats)) {
+    if (id === input.sessionKey) return { chatId, recovered: true }
+  }
+  return input.sessionKey.startsWith('wechat-') ? 'skipped' : undefined
+}
+
 /** 凭据有效期（腾讯策略：扫码 token 约 24 小时过期）。 */
 export const CREDENTIAL_TTL_MS = 24 * 60 * 60 * 1000
 

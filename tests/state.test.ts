@@ -86,6 +86,21 @@ describe('loadGatewayState', () => {
     await expect(loadGatewayState(path)).rejects.toThrow(/deliveryLog/)
   })
 
+  it('加载时超限的 deliveryLog 被钳制到 20 条', async () => {
+    const path = await tempFile('state.json')
+    // pushDeliveryEntry 约定新的在前：t24 最新（index 0）、t0 最旧；钳制应保留最新的 20 条、淘汰最旧的 5 条。
+    const entries = Array.from({ length: 25 }, (_, i) => ({ at: `t${24 - i}`, outcome: 'delivered', chunks: 1 }))
+    await writeFile(path, JSON.stringify({
+      version: 1, chats: {}, seenMessageIds: [],
+      protocol: { updatesBuffer: '', contextTokens: {} },
+      deliveryLog: { c: entries },
+    }), { mode: 0o600 })
+    const state = await loadGatewayState(path)
+    expect(state.deliveryLog['c']).toHaveLength(20)
+    expect(state.deliveryLog['c']![0]!.at).toBe('t24')
+    expect(state.deliveryLog['c']![19]!.at).toBe('t5')
+  })
+
   it('拒绝损坏的 credentialWarn', async () => {
     const path = await tempFile('state.json')
     await writeFile(path, JSON.stringify({
