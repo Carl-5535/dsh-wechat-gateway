@@ -19,6 +19,25 @@ export interface OutboxItem {
   nextFile: number
 }
 
+/** 单条投递记录（有界审计日志，每键最多 20 条，新的在前）。 */
+export interface DeliveryLogEntry {
+  at: string
+  outcome: 'delivered' | 'deferred' | 'skipped' | 'failed'
+  /** 失败/跳过原因（截断到 ~200 字符）。 */
+  detail?: string
+  /** 本轮涉及的文本块数。 */
+  chunks: number
+}
+
+/** 每键保留的最大条数。 */
+export const DELIVERY_LOG_LIMIT = 20
+
+/** 不可变追加：返回新记录，原记录不动；超过上限从尾部淘汰。 */
+export function pushDeliveryEntry(log: Record<string, DeliveryLogEntry[]>, key: string, entry: DeliveryLogEntry): Record<string, DeliveryLogEntry[]> {
+  const updated = [entry, ...(log[key] ?? [])].slice(0, DELIVERY_LOG_LIMIT)
+  return { ...log, [key]: updated }
+}
+
 export interface GatewayState {
   version: 1
   /** chatId → DSH 会话 id。 */
@@ -27,6 +46,8 @@ export interface GatewayState {
   seenMessageIds: string[]
   protocol: ILinkState
   outbox: Record<string, OutboxItem>
+  /** 投递审计日志：chatId（skipped 用 session id）→ 最近 20 条，新的在前。 */
+  deliveryLog: Record<string, DeliveryLogEntry[]>
   /** 运行时覆盖的工作目录（空串或缺失时回退到 config.workspace）。 */
   workspace?: string
   /** 最近一次收到微信消息的时间（ISO）：凭据 24 小时有效期从最近收信重新计起。 */
@@ -48,6 +69,7 @@ function emptyState(): GatewayState {
     seenMessageIds: [],
     protocol: { updatesBuffer: '', contextTokens: {} },
     outbox: {},
+    deliveryLog: {},
     workspace: undefined,
     credentialActivityAt: undefined,
     expiryWarnEnabled: undefined,
@@ -67,6 +89,27 @@ function stringRecord(value: unknown, field: string): Record<string, string> {
     output[key] = item
   }
   return output
+}
+
+const DELIVERY_OUTCOMES = new Set(['delivered', 'deferred', 'skipped', 'failed'])
+
+function deliveryLogFrom(value: unknown): Record<string, DeliveryLogEntry[]> {
+  if (value === undefined) return {}
+  const source = asRecord(value, 'deliveryLog')
+  const log: Record<string, DeliveryLogEntry[]> = {}
+  for (const [key, entries] of Object.entries(source)) {
+    if (!Array.isArray(entries)) throw new Error(`状态文件 deliveryLog.${key} 必须是数组`)
+    log[key] = entries.map((raw, index) => {
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`状态文件 deliveryLog.${key}[${index}] 必须是对象`)
+      const entry = raw as Record<string, unknown>
+      if (typeof entry.at !== 'string') throw new Error(`状态文件 deliveryLog.${key}[${index}].at 必须是字符串`)
+      if (typeof entry.outcome !== 'string' || !DELIVERY_OUTCOMES.has(entry.outcome)) throw new Error(`状态文件 deliveryLog.${key}[${index}].outcome 无效`)
+      if (typeof entry.chunks !== 'number' || !Number.isInteger(entry.chunks) || entry.chunks < 0) throw new Error(`状态文件 deliveryLog.${key}[${index}].chunks 无效`)
+      if (entry.detail !== undefined && typeof entry.detail !== 'string') throw new Error(`状态文件 deliveryLog.${key}[${index}].detail 必须是字符串`)
+      return { at: entry.at, outcome: entry.outcome as DeliveryLogEntry['outcome'], chunks: entry.chunks, ...(entry.detail === undefined ? {} : { detail: entry.detail }) }
+    }).slice(0, DELIVERY_LOG_LIMIT)
+  }
+  return log
 }
 
 /** 加载并严格校验状态文件；不存在时返回空状态。 */
@@ -106,6 +149,7 @@ export async function loadGatewayState(path: string): Promise<GatewayState> {
     seenMessageIds: [...value.seenMessageIds],
     protocol: { updatesBuffer: protocolSource.updatesBuffer, contextTokens },
     outbox,
+    deliveryLog: deliveryLogFrom(value.deliveryLog),
     workspace: typeof value.workspace === 'string' ? value.workspace : undefined,
     credentialActivityAt: typeof value.credentialActivityAt === 'string' ? value.credentialActivityAt : undefined,
     expiryWarnEnabled: typeof value.expiryWarnEnabled === 'boolean' ? value.expiryWarnEnabled : undefined,
@@ -125,7 +169,8 @@ export class GatewayStateStore {
   }
 
   save(): Promise<void> {
-    this.#pending = this.#pending.then(async () => {
+    // 先吞掉前一次的失败再排队写盘：写盘错误只属于当次调用，不毒化后续 save。
+    this.#pending = this.#pending.catch(() => undefined).then(async () => {
       await writePrivateJson(this.path, structuredClone(this.state))
     })
     return this.#pending

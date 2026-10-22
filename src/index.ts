@@ -23,7 +23,7 @@ import type { ApprovalRequest, ApprovalOutcome } from '@deepseek-ai/dsh-user-app
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { ILinkClient, type InboundMessage } from './ilink.js'
 import { defaultCredentialPath, pathExists, readCredential } from './store.js'
-import { defaultStatePath, GatewayStateStore, loadGatewayState } from './state.js'
+import { defaultStatePath, GatewayStateStore, loadGatewayState, pushDeliveryEntry, type DeliveryLogEntry } from './state.js'
 import { contentUserMessage, installSelection, sessionId } from './harness.js'
 import { extractFileDirectives, resolveWorkspaceFile, saveInboundMedia, splitText, detectLocalFilePaths } from './media.js'
 import { mountLoginRoute } from './web-login.js'
@@ -91,6 +91,23 @@ export function isAllowed(message: InboundMessage, config: Config): boolean {
   return message.group
     ? config.allowedGroups.includes(message.chatId) && config.allowedUsers.includes(message.userId)
     : config.allowedUsers.includes(message.userId)
+}
+
+/** 投递路由结果：命中（recovered 标记是否经由持久映射反查恢复）、skipped（网关会话失联）。 */
+export type DeliveryTarget = { chatId: string; recovered: boolean } | 'skipped'
+
+/**
+ * turn/end 的投递路由判定：内存映射为快路径；缺失时反查持久映射 state.chats
+ * （chatId → sessionId）；网关创建的会话 id 均带 wechat- 前缀，两处都查不到却
+ * 仍带前缀说明持久映射已失去（记 skipped）；无前缀的是普通非微信会话（undefined，
+ * 正常路径，不记日志）。
+ */
+export function resolveDeliveryTarget(input: { mappedChatId: string | undefined; chats: Record<string, string>; sessionKey: string }): DeliveryTarget | undefined {
+  if (input.mappedChatId !== undefined) return { chatId: input.mappedChatId, recovered: false }
+  for (const [chatId, id] of Object.entries(input.chats)) {
+    if (id === input.sessionKey) return { chatId, recovered: true }
+  }
+  return input.sessionKey.startsWith('wechat-') ? 'skipped' : undefined
 }
 
 /** 凭据有效期（腾讯策略：扫码 token 约 24 小时过期）。 */
@@ -425,22 +442,36 @@ class WechatGateway {
       if (state?.handle.agent === agent) this.#chats.delete(chatId)
     }))
     // 每轮结束：把助手回复送回微信（串行排队，防止交错）。
+    // 路由：先查内存映射（快路径）；缺失时反查持久映射 state.chats 并就地
+    // 恢复（DSH 重启或 Web UI 重开会话后自动接回）；网关会话两处都缺失记
+    // skipped 落盘；非微信会话静默返回。
     this.#listeners.push(this.#ctx.on('session/event', (session, event) => {
       if (event.type !== 'turn/end') return
       const agent = this.#ctx.agents.get(session.id)
       if (agent === undefined) return
-      const chatId = this.#agentChats.get(agent)
-      if (chatId === undefined) return
-      const state = this.#chats.get(chatId)
-      if (state === undefined) return
-      state.delivery = state.delivery
-        .then(async () => {
+      const target = resolveDeliveryTarget({ mappedChatId: this.#agentChats.get(agent), chats: this.#store.state.chats, sessionKey: session.id })
+      if (target === undefined) return
+      if (target === 'skipped') {
+        this.#recordDeliveryLog(session.id, this.#deliveryEntry('skipped', 0, '网关会话的持久映射缺失，无法路由投递'))
+        return
+      }
+      const chatId = target.chatId
+      void Promise.resolve().then(async () => {
+        // 内存状态缺失（重启/被 Web UI 接管后）就地恢复；#chat 会补全 #agentChats，后续轮次走快路径。
+        const state = this.#chats.get(chatId) ?? await this.#chat(chatId)
+        const run = state.delivery.then(async () => {
           await this.#ctx.sessions.flush(session)
           await this.#deliver(chatId, state)
         })
-        .catch((error: unknown) => {
-          if (!this.#abort.signal.aborted) this.#log(`投递失败: ${error instanceof Error ? error.message : String(error)}`)
-        })
+        // 投递链吞错续链（错误交给外层 catch 记 failed），后续轮次照常排队。
+        state.delivery = run.then(() => undefined, () => undefined)
+        await run
+      }).catch((error: unknown) => {
+        if (this.#abort.signal.aborted) return
+        const detail = error instanceof Error ? error.message : String(error)
+        this.#log(`投递失败: ${detail}`)
+        this.#recordDeliveryLog(chatId, this.#deliveryEntry('failed', 0, detail.slice(0, 200)))
+      })
     }))
     // 审批应答（waterfall，prepend 保证 OUTER）：微信绑定的 Agent 发起审批时
     // 问题先只发微信（串行）；回复「网页」或通道失效再转交 Web UI 面板，避免
@@ -494,6 +525,19 @@ class WechatGateway {
     process.stderr.write(`wechat-gateway: ${message}\n`)
   }
 
+  /** 追加一条投递记录并落盘（尽力而为：落盘失败只记 stderr，不阻断投递链）。 */
+  #recordDeliveryLog(key: string, entry: DeliveryLogEntry): void {
+    this.#store.state.deliveryLog = pushDeliveryEntry(this.#store.state.deliveryLog, key, entry)
+    void this.#store.save().catch((error: unknown) => {
+      if (!this.#abort.signal.aborted) this.#log(`投递日志落盘失败: ${error instanceof Error ? error.message : String(error)}`)
+    })
+  }
+
+  /** 统一构造投递记录（at 取当下，detail 缺省时不写字段）。 */
+  #deliveryEntry(outcome: DeliveryLogEntry['outcome'], chunks: number, detail?: string): DeliveryLogEntry {
+    return { at: new Date().toISOString(), outcome, chunks, ...(detail === undefined ? {} : { detail }) }
+  }
+
   /** 回合结束 → 提取回复 → 写入持久化发件箱 → 尽力送完。 */
   async #deliver(chatId: string, state: ChatState): Promise<void> {
     await state.typing
@@ -513,9 +557,16 @@ class WechatGateway {
     this.#store.state.outbox[chatId] = { chunks, files: [...carriedFiles, ...delivery.files, ...mentioned], next: 0, nextFile: 0 }
     await this.#store.save()
     await this.#drainOutbox(chatId)
+    if (this.#abort.signal.aborted) return
     // 全部送达才推进 sentThroughSeq：中途崩溃重启后会重发该轮回复，
     // 代价是极端情况下的重复消息，换来绝不丢失。
-    if (!this.#abort.signal.aborted && this.#store.state.outbox[chatId] === undefined) state.sentThroughSeq = output.seq
+    if (this.#store.state.outbox[chatId] === undefined) {
+      state.sentThroughSeq = output.seq
+      this.#recordDeliveryLog(chatId, this.#deliveryEntry('delivered', chunks.length))
+      return
+    }
+    // 发送未完成（通道断）：内容保留在 outbox，重启后由 #drainStoredOutbox 续发。
+    this.#recordDeliveryLog(chatId, this.#deliveryEntry('deferred', chunks.length, '发送未完成，内容保留在发件箱待重试'))
   }
 
   async #drainStoredOutbox(): Promise<void> {
