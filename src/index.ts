@@ -20,6 +20,7 @@ import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { ApprovalRequest, ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
+import type { AskUserQuestionAnswer, AskUserQuestionAnswerItem, AskUserQuestionItem, AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions'
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { ILinkClient, type InboundMessage } from './ilink.js'
 import { defaultCredentialPath, pathExists, readCredential } from './store.js'
@@ -181,6 +182,16 @@ interface ChatState {
   typing: Promise<void>
 }
 
+/** 一条送达微信、等待答复的选择题。 */
+interface PendingQuestion {
+  question: AskUserQuestionItem
+  /** 第几题（从 0 起）与总题数，仅用于文案标注。 */
+  index: number
+  total: number
+  /** 结算当前问题；undefined 表示转交网页端或请求中止。重复调用无效。 */
+  settle: (reply: QuestionReply | undefined) => void
+}
+
 /** 一条送达微信、等待答复的审批请求。 */
 interface PendingApproval {
   toolName: string
@@ -278,6 +289,69 @@ export function parseApprovalReply(text: string): ApprovalReplyAction | undefine
   return undefined
 }
 
+/** 微信里对一条选择题答复的解析结果。 */
+export type QuestionReply =
+  | { kind: 'answer'; item: AskUserQuestionAnswerItem }
+  | { kind: 'web' }
+  | { kind: 'invalid'; reason: string }
+
+/** 触发转交网页端作答的答复词（与审批共用同一组）。 */
+const QUESTION_WEB_WORDS = APPROVAL_WEB_WORDS
+
+/**
+ * 选择题在微信里的呈现文案：题干、可选项编号（多选时附提示）与作答说明。
+ * index/total 用于一次多题时标注「第几题」。
+ */
+export function questionPrompt(question: AskUserQuestionItem, index = 0, total = 1): string {
+  const lines: string[] = [total > 1 ? `❓ 问题 ${index + 1}/${total}` : '❓ 需要你选择']
+  if (question.header !== undefined && question.header !== '') lines.push(`【${question.header}】`)
+  lines.push(question.question)
+  if (question.detail !== undefined && question.detail !== '') {
+    for (const line of question.detail.split('\n')) lines.push(`  ${line}`)
+  }
+  const options = question.options ?? []
+  if (options.length === 0) {
+    lines.push('直接回复你的回答；回复「网页」转到网页端。')
+    return lines.join('\n')
+  }
+  options.forEach((option, position) => {
+    const description = option.description === undefined || option.description === '' ? '' : ` —— ${option.description}`
+    lines.push(`  ${position + 1}. ${option.label}${description}`)
+  })
+  lines.push(question.multiSelect === true
+    ? '回复编号可多选（逗号分隔，如 1,3）；直接回复其他文字作为自定义回答；回复「网页」转到网页端。'
+    : '回复编号选择；直接回复其他文字作为自定义回答；回复「网页」转到网页端。')
+  return lines.join('\n')
+}
+
+/**
+ * 解析微信里对一条选择题的答复：纯编号 → 选中对应选项（多选允许逗号/顿号/空格
+ * 分隔）；与某个选项标签完全一致（忽略大小写）→ 选中该选项；其余非空文本 →
+ * 自定义回答；转交词 → 'web'；空文本、越界编号、单选却给多个编号 → 'invalid'
+ * （调用方提示后继续等待，不消费该消息）。
+ */
+export function parseQuestionReply(question: AskUserQuestionItem, text: string): QuestionReply {
+  const raw = text.trim()
+  if (raw === '') return { kind: 'invalid', reason: '请回复选项编号或回复内容。' }
+  if (QUESTION_WEB_WORDS.has(raw.toLowerCase())) return { kind: 'web' }
+  const options = question.options ?? []
+  if (options.length === 0) return { kind: 'answer', item: { id: question.id, selected: [], custom: raw } }
+  const parts = raw.split(/[,，、\s]+/u).filter(part => part !== '')
+  if (parts.length > 0 && parts.every(part => /^\d+$/.test(part))) {
+    const picked: string[] = []
+    for (const part of parts) {
+      const option = options[Number(part) - 1]
+      if (option === undefined) return { kind: 'invalid', reason: `编号超出范围，请回复 1-${options.length}。` }
+      if (!picked.includes(option.label)) picked.push(option.label)
+    }
+    if (picked.length > 1 && question.multiSelect !== true) return { kind: 'invalid', reason: '这是单选题，请只回复一个编号。' }
+    return { kind: 'answer', item: { id: question.id, selected: picked } }
+  }
+  const byLabel = options.find(option => option.label.toLowerCase() === raw.toLowerCase())
+  if (byLabel !== undefined) return { kind: 'answer', item: { id: question.id, selected: [byLabel.label] } }
+  return { kind: 'answer', item: { id: question.id, selected: [], custom: raw } }
+}
+
 /** 内置预设的中文别名（仅当该预设存在于表中时生效）。 */
 const PRESET_ALIASES: Record<string, readonly string[]> = {
   'workspace-write': ['保守', '安全', '写工作区'],
@@ -328,6 +402,7 @@ const HELP_TEXT = [
   '  /permission 或 /权限 —— 查看权限模式；/permission 序号或名称切换（仅本聊天生效）',
   '发给我的图片/文件会保存到工作区；我可以用 [[send-file:路径]] 把工作区文件发回给你。',
   '当我请求越权操作时会推送审批请求：回复「同意」或「拒绝」处理，回复「网页」转到网页端审批面板。',
+  '当我需要你从选项里选择时会推送选择题：回复编号（多选可用逗号，如 1,3）或直接回复文字；回复「网页」转到网页端作答。',
 ].join('\n')
 
 class WechatGateway {
@@ -354,6 +429,10 @@ class WechatGateway {
   readonly #pendingApprovals = new Map<string, PendingApproval>()
   /** 每聊天的审批串行链：上一道问题得到答复（或转交/中止）后才投递下一道，保证答复永远路由到当前展示的问题。 */
   readonly #approvalAskChain = new Map<string, Promise<void>>()
+  /** 每聊天当前等待微信答复的选择题（一次一条；后续请求排队）。 */
+  readonly #pendingQuestions = new Map<string, PendingQuestion>()
+  /** 每聊天的选择题串行链：上一题答复后才投递下一题或下一个请求。 */
+  readonly #questionAskChain = new Map<string, Promise<void>>()
   /** start() 注册的 ctx 监听器注销函数（重新扫码重启网关时清理，避免残留）。 */
   readonly #listeners: Array<() => void> = []
 
@@ -480,6 +559,15 @@ class WechatGateway {
       const chatId = this.#agentChats.get(req.agent)
       if (chatId === undefined || !this.#channelHealthy) return await next()
       return await this.#approvalViaWechat(chatId, req, next)
+    }, true))
+    // 选择题作答（waterfall，prepend 保证 OUTER）：微信绑定的 Agent 需要用户在
+    // 选项里做选择时，问题先逐题发微信；回复「网页」、通道判死或请求中止再把
+    // 整个请求转交后续应答者（Web UI 的选择题卡片）。其余 Agent 的请求透传。
+    this.#listeners.push(this.#ctx.on('user-questions/request', async (req, next) => {
+      const agent = req.agent
+      const chatId = agent === undefined ? undefined : this.#agentChats.get(agent)
+      if (chatId === undefined || !this.#channelHealthy) return await next()
+      return await this.#questionViaWechat(chatId, req, next)
     }, true))
     void this.#startLoop().catch((error: unknown) => {
       if (!this.#abort.signal.aborted) this.#log(`网关停止: ${error instanceof Error ? error.message : String(error)}`)
@@ -775,6 +863,64 @@ class WechatGateway {
     return action
   }
 
+  /**
+   * 选择题 answerer 主体（串行，微信优先）：逐题发送、逐题等待答复，全部作答后
+   * 一次性返回答案批次。任何一步转交（用户回复「网页」、通道判死、请求中止）都
+   * 交给 next() 处理，避免微信与 Web UI 两条链路同时挂起同一道题。
+   */
+  async #questionViaWechat(chatId: string, req: AskUserQuestionRequest, next: () => Promise<AskUserQuestionAnswer>): Promise<AskUserQuestionAnswer> {
+    const chain = this.#questionAskChain.get(chatId) ?? Promise.resolve()
+    const handled = chain.then(async (): Promise<AskUserQuestionAnswer | undefined> => {
+      const answers: AskUserQuestionAnswerItem[] = []
+      for (const [index, question] of req.questions.entries()) {
+        if (req.signal?.aborted === true) return undefined
+        const reply = await this.#askOneQuestion(chatId, question, index, req.questions.length, req.signal)
+        if (reply === undefined) return undefined
+        if (reply.kind === 'web') {
+          await this.#sendWithRetry(chatId, '↗️ 已转到网页端作答，请在网页端处理。')
+          return undefined
+        }
+        if (reply.kind === 'invalid') return undefined // 拦截层不会结算 invalid，这里只做兜底
+        answers.push(reply.item)
+      }
+      return { answers }
+    })
+    this.#questionAskChain.set(chatId, handled.then(() => undefined, () => undefined))
+    const result = await handled
+    return result ?? await next()
+  }
+
+  /**
+   * 投递一道题并等待微信答复：返回 undefined 表示转交网页端（通道判死或请求
+   * 中止），'web' 表示用户主动要求转网页端；'invalid' 不会返回——拦截层提示后
+   * 继续等待同一题。
+   */
+  async #askOneQuestion(chatId: string, question: AskUserQuestionItem, index: number, total: number, signal?: AbortSignal): Promise<QuestionReply | undefined> {
+    return await new Promise<QuestionReply | undefined>((resolve) => {
+      let done = false
+      let timer: ReturnType<typeof setInterval> | undefined
+      const finish = (value: QuestionReply | undefined): void => {
+        if (done) return
+        done = true
+        if (timer !== undefined) clearInterval(timer)
+        if (this.#pendingQuestions.get(chatId) === pending) this.#pendingQuestions.delete(chatId)
+        resolve(value)
+      }
+      const pending: PendingQuestion = { question, index, total, settle: finish }
+      this.#pendingQuestions.set(chatId, pending)
+      // 看门狗与请求中止：与审批一致，通道判死或任务结束时转交，避免永远挂起。
+      timer = setInterval(() => { if (!this.#channelHealthy) finish(undefined) }, 30_000)
+      ;(timer as { unref?: () => void }).unref?.()
+      if (signal?.aborted === true) {
+        finish(undefined)
+        return
+      }
+      signal?.addEventListener('abort', () => finish(undefined), { once: true })
+      // 投递失败不阻断：看门狗发现通道失效后会转交网页端。
+      void this.#sendWithRetry(chatId, questionPrompt(question, index, total), signal).catch(() => undefined)
+    })
+  }
+
   /** /permission：无参列出权限模式并标记当前项；带参切换本聊天的模式。 */
   async #permissionCommand(chatId: string, rest: string): Promise<void> {
     const presets = this.#ctx.get('permissionPresets') as PermissionPresetService | undefined
@@ -875,6 +1021,29 @@ class WechatGateway {
     if (command === '/permission' || command === '/权限' || message.text.trim().startsWith('/permission ') || message.text.trim().startsWith('/权限 ')) {
       const rest = message.text.trim().replace(/^\/(?:permission|权限)\s*/u, '').trim()
       await this.#permissionCommand(message.chatId, rest)
+      return
+    }
+    // 待作答的选择题拦截：编号/选项标签 → 结算该题；其余非空文本作为自定义回答；
+    // 「网页」转交网页端；解析失败（空文本/越界/单选给多选）提示后继续等待。
+    // 若同时挂着审批且本条更像审批答复（如「同意」），让下面的审批分支优先。
+    const pendingQuestion = this.#pendingQuestions.get(message.chatId)
+    const approvalAlsoPending = this.#pendingApprovals.has(message.chatId) && parseApprovalReply(message.text) !== undefined
+    if (pendingQuestion !== undefined && !approvalAlsoPending) {
+      const reply = parseQuestionReply(pendingQuestion.question, message.text)
+      if (reply.kind === 'invalid') {
+        await this.#sendWithRetry(message.chatId, `⚠️ ${reply.reason}`)
+        return
+      }
+      this.#pendingQuestions.delete(message.chatId)
+      if (reply.kind === 'web') {
+        await this.#sendWithRetry(message.chatId, '↗️ 已转到网页端作答，请在网页端处理。')
+      } else {
+        const shown = reply.item.custom !== undefined && reply.item.custom !== ''
+          ? reply.item.custom
+          : reply.item.selected.join('、')
+        await this.#sendWithRetry(message.chatId, `✅ 已记录：${shown}`)
+      }
+      pendingQuestion.settle(reply)
       return
     }
     // 待审批时的答复拦截：认可/拒绝词消费为审批结果，「网页」转交网页端，
